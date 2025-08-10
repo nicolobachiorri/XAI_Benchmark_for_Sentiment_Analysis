@@ -190,6 +190,15 @@ def evaluate_robustness_over_dataset(
         return 0.0
 
 # ==== 2. CONSISTENCY (ottimizzata con inference seed) ====
+"""
+MODIFICHE PER CONSISTENCY CON DEVIAZIONE STANDARD
+================================================
+
+Modifica la funzione compute_consistency_inference_seed in metrics.py
+per restituire sia media che deviazione standard delle correlazioni.
+"""
+
+# ==== 2. CONSISTENCY (MODIFICATA per restituire media ± std) ====
 def compute_consistency_inference_seed(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
@@ -197,8 +206,8 @@ def compute_consistency_inference_seed(
     texts: List[str],
     seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS,
     show_progress: bool = True
-) -> float:
-    """Consistency con inference seed (ottimizzata per Colab)."""
+) -> Tuple[float, float]:  # CAMBIATO: restituisce (media, std)
+    """Consistency con inference seed (MODIFICATA per restituire media ± std)."""
     
     # Limita testi per consistency (computazionalmente intensiva)
     if len(texts) > MAX_CONSISTENCY_SAMPLES:
@@ -264,18 +273,61 @@ def compute_consistency_inference_seed(
                 )
                 correlations.append(correlation)
         
-        final_consistency = float(np.mean(correlations)) if correlations else 0.0
+        # MODIFICATA: calcola sia media che deviazione standard
+        if correlations:
+            mean_consistency = float(np.mean(correlations))
+            std_consistency = float(np.std(correlations, ddof=1)) if len(correlations) > 1 else 0.0
+        else:
+            mean_consistency = 0.0
+            std_consistency = 0.0
         
         if show_progress:
-            print(f"  [RESULT] Consistency: {final_consistency:.4f}")
+            print(f"  [RESULT] Consistency: {mean_consistency:.4f} ± {std_consistency:.4f}")
         
-        return final_consistency
+        return mean_consistency, std_consistency  # CAMBIATO: restituisce tupla
         
     finally:
         # Ripristina stato modello
         model.train(original_mode)
         for name, param in model.named_parameters():
             param.requires_grad_(original_requires_grad[name])
+
+# MODIFICATA: Wrapper per compatibilità che restituisce tupla
+def compute_consistency(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    explainer: Callable[[str], Attribution],
+    texts: List[str],
+    seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS,
+    show_progress: bool = False
+) -> Tuple[float, float]:  # CAMBIATO: restituisce (media, std)
+    """Wrapper per consistency che restituisce (media, std)."""
+    return compute_consistency_inference_seed(
+        model=model,
+        tokenizer=tokenizer,
+        explainer=explainer,
+        texts=texts,
+        seeds=seeds,
+        show_progress=show_progress
+    )
+
+def evaluate_consistency_over_dataset(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizer,
+    explainer: Callable[[str], Attribution],
+    texts: List[str],
+    seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS,
+    show_progress: bool = True
+) -> Tuple[float, float]:  # CAMBIATO: restituisce (media, std)
+    """Wrapper per consistency evaluation che restituisce (media, std)."""
+    return compute_consistency_inference_seed(
+        model=model,
+        tokenizer=tokenizer,
+        explainer=explainer,
+        texts=texts,
+        seeds=seeds,
+        show_progress=show_progress
+    )
 
 def _compute_spearman_correlation_explanations(
     explanations_a: List[Attribution],
@@ -317,42 +369,6 @@ def _compute_spearman_correlation_explanations(
     
     return np.mean(correlations) if correlations else 0.0
 
-# Wrapper per compatibilità
-def compute_consistency(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    explainer: Callable[[str], Attribution],
-    texts: List[str],
-    seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS,
-    show_progress: bool = False
-) -> float:
-    """Wrapper per consistency."""
-    return compute_consistency_inference_seed(
-        model=model,
-        tokenizer=tokenizer,
-        explainer=explainer,
-        texts=texts,
-        seeds=seeds,
-        show_progress=show_progress
-    )
-
-def evaluate_consistency_over_dataset(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    explainer: Callable[[str], Attribution],
-    texts: List[str],
-    seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS,
-    show_progress: bool = True
-) -> float:
-    """Wrapper per consistency evaluation."""
-    return compute_consistency_inference_seed(
-        model=model,
-        tokenizer=tokenizer,
-        explainer=explainer,
-        texts=texts,
-        seeds=seeds,
-        show_progress=show_progress
-    )
 
 # ==== 3. CONTRASTIVITY (ottimizzata) ====
 def _normalize_scores_for_distribution(scores: List[float]) -> np.ndarray:

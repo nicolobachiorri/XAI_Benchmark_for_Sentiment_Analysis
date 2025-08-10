@@ -753,15 +753,24 @@ def process_model_simplified(
                                 score = 0.0
                                 
                         elif metric_name == "consistency":
-                            score = metrics.evaluate_consistency_over_dataset(
+                            # MODIFICATA: gestisce tupla (media, std)
+                            mean_score, std_score = metrics.evaluate_consistency_over_dataset(
                                 model=model,
                                 tokenizer=tokenizer,
                                 explainer=explainer,
                                 texts=consistency_texts,
                                 seeds=DEFAULT_CONSISTENCY_SEEDS,
-                                show_progress=False
-                            )
+                                show_progress=False)
+                        
+                            # Salva come stringa formattata
+                            if std_score > 0:
+                                formatted_score = f"{mean_score:.4f}±{std_score:.4f}"
+                            else:
+                                formatted_score = f"{mean_score:.4f}±0.0000"
                             
+                            results[metric_name][explainer_name] = formatted_score
+                            score = mean_score 
+
                         elif metric_name == "human_reasoning":
                             if hr_available and hr_dataset is not None:
                                 score = metrics.evaluate_human_reasoning_over_dataset(
@@ -964,8 +973,14 @@ def build_report_tables(all_results: Dict[str, Dict], metrics_to_compute: List[s
             explainer_scores = model_data["results"][metric]
             
             for explainer_name, score in explainer_scores.items():
-                if score is not None and not (isinstance(score, float) and np.isnan(score)):
-                    metric_data[explainer_name][model_key] = score
+                if score is not None:
+                    # GESTIONE SPECIALE PER CONSISTENCY
+                    if metric == "consistency" and isinstance(score, str) and "±" in score:
+                        # Mantieni il formato stringa "media±std"
+                        metric_data[explainer_name][model_key] = score
+                    elif not (isinstance(score, float) and np.isnan(score)):
+                        # Altri casi normali
+                        metric_data[explainer_name][model_key] = score
         
         if metric_data:
             df = pd.DataFrame(metric_data).T
@@ -986,6 +1001,55 @@ def print_table_analysis(df: pd.DataFrame, metric_name: str):
     if df.empty:
         print("No data available for analysis")
         return
+    if metric_name == "consistency":
+        print(" Per-Explainer Statistics (mean ± std):")
+        print("-" * 50)
+        
+        for explainer in df.index:
+            values_str = df.loc[explainer].dropna()
+            if len(values_str) > 0:
+                # Parse valori mean±std
+                means = []
+                stds = []
+                for val_str in values_str:
+                    if isinstance(val_str, str) and "±" in val_str:
+                        try:
+                            mean_part, std_part = val_str.split("±")
+                            means.append(float(mean_part))
+                            stds.append(float(std_part))
+                        except ValueError:
+                            continue
+                
+                if means:
+                    avg_mean = np.mean(means)
+                    avg_std = np.mean(stds)
+                    count = len(means)
+                    coverage = count / len(df.columns)
+                    print(f"  {explainer:>15s}: μ={avg_mean:.4f}±{avg_std:.4f} (n={count}, {coverage:.1%} coverage)")
+        
+        # Top combinations per consistency
+        print(f"\n Top 5 Combinations (by mean consistency):")
+        print("-" * 50)
+        flat_data = []
+        for explainer in df.index:
+            for model in df.columns:
+                value = df.loc[explainer, model]
+                if isinstance(value, str) and "±" in value:
+                    try:
+                        mean_part, std_part = value.split("±")
+                        mean_val = float(mean_part)
+                        std_val = float(std_part)
+                        flat_data.append((explainer, model, mean_val, std_val, value))
+                    except ValueError:
+                        continue
+        
+        if flat_data:
+            flat_data.sort(key=lambda x: x[2], reverse=True)  # Sort by mean
+            print(f"  (Higher = Better)")
+            for i, (explainer, model, mean_val, std_val, formatted) in enumerate(flat_data[:5]):
+                print(f"  {i+1}. {explainer:>12s} + {model:>12s}: {formatted}")
+        
+        return  # IMPORTANTE: esce qui per consistency
     
     # Statistiche per explainer
     print(" Per-Explainer Statistics:")

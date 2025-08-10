@@ -250,7 +250,9 @@ def evaluate_combination(model_key: str, explainer_name: str, metric_name: str,
         elif metric_name == "consistency":
             print(f"\n[CONSISTENCY] Evaluating inference seed stability...")
             consistency_texts = texts[:min(50, len(texts))]  # Limit for speed
-            score = metrics.evaluate_consistency_over_dataset(
+            
+            # MODIFICATA: gestisce tupla (media, std)
+            mean_score, std_score = metrics.evaluate_consistency_over_dataset(
                 model=model,
                 tokenizer=tokenizer,
                 explainer=explainer,
@@ -259,6 +261,10 @@ def evaluate_combination(model_key: str, explainer_name: str, metric_name: str,
                 show_progress=True
             )
             
+            score = mean_score  # Per compatibilità con return
+            formatted_result = f"{mean_score:.4f}±{std_score:.4f}"  # Per display
+            print(f"[CONSISTENCY] Mean score: {formatted_result} (over {len(consistency_texts)} examples)")  
+
         elif metric_name == "human_reasoning":
             print(f"\n[HUMAN REASONING] Evaluating agreement with human-like reasoning...")
             
@@ -314,7 +320,13 @@ def evaluate_combination(model_key: str, explainer_name: str, metric_name: str,
         print(f"Model:     {model_key}")
         print(f"Explainer: {explainer_name}")
         print(f"Metric:    {metric_name}")
-        print(f"Score:     {score:.4f}")
+        if metric_name == "consistency" and 'formatted_result' in locals():
+            print(f"Score: {formatted_result}")
+            print(f"Mean: {mean_score:.4f}")
+            print(f"Std Dev: {std_score:.4f}")
+        
+        else:
+            print(f"Score: {score:.4f}")
         
         # Interpretation
         if metric_name == "robustness":

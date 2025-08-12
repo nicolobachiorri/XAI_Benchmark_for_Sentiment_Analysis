@@ -438,29 +438,27 @@ def compute_contrastivity(
     except Exception:
         return 0.0
 
-# ==== 4. HUMAN REASONING AGREEMENT (INTEGRATO) ====
 def compute_human_reasoning_score(xai_tokens: List[str], xai_scores: List[float], 
                                 hr_ranking: List[str]) -> float:
     """
-    Calcola Human Reasoning Agreement usando Mean Average Precision (MAP)
-    
-    Args:
-        xai_tokens: Lista token dall'explainer
-        xai_scores: Lista score corrispondenti  
-        hr_ranking: Lista parole ordinate da LLM (più importante → meno importante)
-    
-    Returns:
-        float: Average Precision score (0-1, higher is better)
+    Calcola Human Reasoning Agreement usando Mean Average Precision (MAP) - OTTIMIZZATO TOP-4
     """
     if not hr_ranking or not xai_tokens or not xai_scores:
+        return 0.0
+    
+    #  OTTIMIZZAZIONE TOP-4: Usa solo le prime 4 parole più importanti
+    TOP_K = 4
+    hr_ranking_top4 = hr_ranking[:min(TOP_K, len(hr_ranking))]
+    
+    if not hr_ranking_top4:
         return 0.0
     
     # Ordina XAI tokens per score (decrescente)
     xai_ranking = [token.lower() for token, score in 
                   sorted(zip(xai_tokens, xai_scores), key=lambda x: x[1], reverse=True)]
     
-    # Normalizza HR ranking
-    hr_set = set(word.lower() for word in hr_ranking)
+    # Normalizza HR ranking (solo top-4)
+    hr_set = set(word.lower() for word in hr_ranking_top4)
     
     # Calcola Average Precision
     relevant_count = 0
@@ -472,8 +470,8 @@ def compute_human_reasoning_score(xai_tokens: List[str], xai_scores: List[float]
             precision_at_k = relevant_count / k
             precision_sum += precision_at_k
     
-    # AP = sum(P(k) * rel(k)) / number_of_relevant_documents
-    ap = precision_sum / len(hr_ranking) if hr_ranking else 0.0
+    #  DENOMINATORE TOP-4: Normalizza per le top-4 parole invece di len(hr_ranking)
+    ap = precision_sum / len(hr_ranking_top4) if hr_ranking_top4 else 0.0
     return ap
 
 def evaluate_human_reasoning_over_dataset(

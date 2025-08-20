@@ -146,25 +146,25 @@ def generate_hr_ground_truth(api_key: str, sample_size: int = 400) -> bool:
             valid_count = (hr_dataset['hr_count'] > 0).sum()
             success_rate = valid_count / len(hr_dataset)
             
-            print(f"[HR-GENERATE]  Generated {valid_count}/{len(hr_dataset)} valid examples ({success_rate:.1%})")
+            print(f"[HR-GENERATE] ✅ Generated {valid_count}/{len(hr_dataset)} valid examples ({success_rate:.1%})")
             
             # Verifica consistenza
             try:
                 consistent = hr.verify_dataset_consistency()
                 if consistent:
-                    print(f"[HR-GENERATE]  Dataset consistency: VERIFIED")
+                    print(f"[HR-GENERATE] ✅ Dataset consistency: VERIFIED")
                 else:
-                    print(f"[HR-GENERATE]  Dataset consistency: FAILED (unexpected)")
+                    print(f"[HR-GENERATE] ⚠️ Dataset consistency: FAILED (unexpected)")
             except Exception as e:
-                print(f"[HR-GENERATE]  Dataset consistency check failed: {e}")
+                print(f"[HR-GENERATE] Dataset consistency check failed: {e}")
             
             return success_rate > 0.3  # Soglia realistica
         else:
-            print(f"[HR-GENERATE]  Generation failed")
+            print(f"[HR-GENERATE] Generation failed")
             return False
             
     except Exception as e:
-        print(f"[HR-GENERATE]  Error: {e}")
+        print(f"[HR-GENERATE] Error: {e}")
         return False
 
 def ensure_hr_availability(auto_generate: bool = False, api_key: Optional[str] = None) -> bool:
@@ -173,7 +173,7 @@ def ensure_hr_availability(auto_generate: bool = False, api_key: Optional[str] =
     
     if hr_info['available']:
         if hr_info['valid_examples'] < 50:  # Soglia minima
-            print(f"[HR-ENSURE]  Too few valid examples ({hr_info['valid_examples']})")
+            print(f"[HR-ENSURE] Too few valid examples ({hr_info['valid_examples']})")
             return False
         
         # CORREZIONE: Verifica anche consistenza
@@ -182,25 +182,25 @@ def ensure_hr_availability(auto_generate: bool = False, api_key: Optional[str] =
             try:
                 consistent = hr.verify_dataset_consistency()
                 if not consistent:
-                    print(f"[HR-ENSURE]  Dataset consistency failed")
+                    print(f"[HR-ENSURE] Dataset consistency failed")
                     if auto_generate and api_key:
                         print(f"[HR-ENSURE] Auto-regenerating due to inconsistency...")
                         return generate_hr_ground_truth(api_key)
                     else:
-                        print(f"[HR-ENSURE]  Inconsistent HR dataset - set auto_generate=True to fix")
+                        print(f"[HR-ENSURE] Inconsistent HR dataset - set auto_generate=True to fix")
                         return False
             except Exception as e:
-                print(f"[HR-ENSURE]  Consistency check error: {e}")
+                print(f"[HR-ENSURE] Consistency check error: {e}")
                 return False
         
-        print(f"[HR-ENSURE]  Human Reasoning available with {hr_info['valid_examples']} examples")
+        print(f"[HR-ENSURE] Human Reasoning available with {hr_info['valid_examples']} examples")
         return True
     
     if auto_generate and api_key:
         print(f"[HR-ENSURE] Auto-generating Human Reasoning ground truth...")
         return generate_hr_ground_truth(api_key)
     else:
-        print(f"[HR-ENSURE]  Human Reasoning not available")
+        print(f"[HR-ENSURE] Human Reasoning not available")
         print(f"[HR-ENSURE] To enable: report.generate_hr_ground_truth('your_api_key')")
         return False
 
@@ -438,7 +438,7 @@ def backup_results_to_drive(results_dir: str = "xai_results", drive_folder: str 
         try:
             from google.colab import drive
             drive.mount('/content/drive')
-            print("[DRIVE]  Google Drive mounted successfully")
+            print("[DRIVE] Google Drive mounted successfully")
         except Exception as e:
             print(f"[DRIVE] Failed to mount Google Drive: {e}")
             return False
@@ -534,7 +534,7 @@ def backup_results_to_drive(results_dir: str = "xai_results", drive_folder: str 
     print(f"  Location: {timestamped_dir}")
     
     if copied_files > 0:
-        print(f"   Results safely backed up to Google Drive!")
+        print(f"  Results safely backed up to Google Drive!")
         print(f"  Access via: My Drive > {drive_folder} > report_{timestamp}")
     
     return success_rate > 0.8  # Success se almeno 80% files copied
@@ -572,15 +572,15 @@ def quick_drive_backup(results_dir: str = "xai_results") -> bool:
             
             shutil.copy2(csv_file, dest_path)
             copied += 1
-            print(f"[DRIVE]  {csv_file.name}")
+            print(f"[DRIVE] {csv_file.name}")
             
         except Exception as e:
-            print(f"[DRIVE]  {csv_file.name}: {e}")
+            print(f"[DRIVE] {csv_file.name}: {e}")
     
     return copied > 0
 
 # =============================================================================
-# CONSISTENCY DEBUG FUNCTIONS (NUOVE)
+# CONSISTENCY DEBUG FUNCTIONS (NUOVE - FIXED)
 # =============================================================================
 
 def debug_consistency_results(all_results: Dict) -> None:
@@ -672,7 +672,7 @@ def test_consistency_format() -> None:
     print(f"\nDebug verification:")
     debug_consistency_results(test_results)
     
-    print(f"\n✅ Consistency format test completed!")
+    print(f"\nConsistency format test completed!")
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -740,7 +740,7 @@ def process_model_simplified(
     adaptive_batching: bool = True,
     recovery: AutoRecovery = None,
     hr_dataset = None  # Pre-loaded HR dataset
-) -> Dict[str, Dict[str, float]]:
+) -> Dict[str, Dict[str, Union[float, str]]]:
     """Processa singolo modello con ottimizzazioni semplificate + Human Reasoning (FIXED CONSISTENCY)."""
     
     print(f"\n{'='*70}")
@@ -804,14 +804,17 @@ def process_model_simplified(
                 valid_hr_count = (hr_dataset['hr_count'] > 0).sum()
                 print(f"[HR] Using {valid_hr_count} valid HR examples")
             else:
-                print(f"[HR]  Human Reasoning not available - will skip HR metric")
+                print(f"[HR] Human Reasoning not available - will skip HR metric")
         
         # Inizializza risultati
         results = {}
         for metric in metrics_to_compute:
             results[metric] = {}
             for explainer in explainers_to_test:
-                results[metric][explainer] = float('nan')
+                if metric == "consistency":
+                    results[metric][explainer] = "NaN±NaN"  # Default for consistency
+                else:
+                    results[metric][explainer] = float('nan')
         
         # PROCESSING SEQUENZIALE SEMPLIFICATO
         print(f"\n[PROCESSING] Sequential processing of {len(explainers_to_test)} explainers...")
@@ -839,6 +842,7 @@ def process_model_simplified(
                             score = metrics.evaluate_robustness_over_dataset(
                                 model, tokenizer, explainer, consistency_texts, show_progress=False
                             )
+                            results[metric_name][explainer_name] = score
                             
                         elif metric_name == "contrastivity":
                             # Process in batch per memoria
@@ -857,6 +861,8 @@ def process_model_simplified(
                                 score = metrics.compute_contrastivity(pos_attrs, neg_attrs)
                             else:
                                 score = 0.0
+                            
+                            results[metric_name][explainer_name] = score
                                 
                         elif metric_name == "consistency":
                             # CORREZIONE CONSISTENCY: Gestisce tupla (media, std) CORRETTAMENTE
@@ -891,17 +897,16 @@ def process_model_simplified(
                                     hr_dataset=hr_dataset,
                                     show_progress=False
                                 )
+                                results[metric_name][explainer_name] = score
                             else:
                                 print("SKIPPED (HR not available)")
                                 score = float('nan')
+                                results[metric_name][explainer_name] = float('nan')
                                 continue
                                 
                         else:
                             score = float('nan')
-                        
-                        # CORREZIONE CHIAVE: Per consistency, NON sovrascrivere formatted_score
-                        if metric_name != "consistency":
-                            results[metric_name][explainer_name] = score
+                            results[metric_name][explainer_name] = float('nan')
                         
                         metric_time = time.time() - metric_start_time
                         print(f" SUCCESS {score:.4f} ({metric_time:.1f}s)")
@@ -1020,7 +1025,7 @@ def verify_checkpoint_completeness(
     expected_metrics: List[str], 
     expected_explainers: List[str]
 ) -> Tuple[bool, str]:
-    """Verifica che il checkpoint contenga tutti i dati attesi."""
+    """Verifica che il checkpoint contenga tutti i dati attesi (FIXED CONSISTENCY)."""
     if not checkpoint_data.get("completed", False):
         return False, "marked as incomplete"
     
@@ -1276,3 +1281,471 @@ def print_table_analysis(df: pd.DataFrame, metric_name: str):
             else:
                 print(f"  → Poor alignment with human-like reasoning")
 
+# =============================================================================
+# MAIN REPORT FUNCTIONS (FIXED CONSISTENCY)
+# =============================================================================
+
+def run_simplified_report(
+    models_to_test: List[str] = None,
+    explainers_to_test: List[str] = None, 
+    metrics_to_compute: List[str] = None,
+    sample_size: int = 100,
+    enable_caching: bool = True,
+    adaptive_batching: bool = True,
+    resume: bool = True,
+    drive_folder: str = "XAI_Results",
+    no_backup: bool = False,
+    hr_api_key: Optional[str] = None,
+    auto_generate_hr: bool = False 
+) -> Dict[str, pd.DataFrame]:
+    """Esegue report completo con architettura semplificata + Human Reasoning + FIXED CONSISTENCY."""
+    
+    start_time = time.time()
+    profiler = PerformanceProfiler()
+    recovery = AutoRecovery(checkpoint_dir=RESULTS_DIR / "checkpoints")
+    
+    profiler.start_operation("simplified_report")
+    
+    try:
+        print_simplified_header()
+        
+        # Analizza risorse sistema
+        system_resources = get_system_resources()
+        
+        # Setup defaults
+        available_models, available_explainers = get_available_resources()
+        
+        if models_to_test is None:
+            models_to_test = available_models
+        if explainers_to_test is None:
+            explainers_to_test = available_explainers
+        if metrics_to_compute is None:
+            metrics_to_compute = METRICS
+        
+        # Filter available
+        models_to_test = [m for m in models_to_test if m in available_models]
+        explainers_to_test = [e for e in explainers_to_test if e in available_explainers]
+        
+        # Smart model ordering
+        models_to_test = smart_model_ordering(models_to_test)
+        
+        # Disabilita ottimizzazioni se risorse insufficienti
+        if system_resources["ram_available_gb"] < MEMORY_THRESHOLD_GB:
+            print(f"[WARNING] Low memory ({system_resources['ram_available_gb']:.1f}GB), disabling some optimizations")
+            adaptive_batching = False
+        
+        # HUMAN REASONING SETUP
+        hr_dataset = None
+        if "human_reasoning" in metrics_to_compute:
+            print(f"\n[HR-SETUP] Human Reasoning metric requested...")
+            
+            hr_available = ensure_hr_availability(auto_generate=auto_generate_hr, api_key=hr_api_key)
+            
+            if hr_available:
+                # Load existing HR dataset
+                hr_dataset = hr.load_ground_truth()
+                if hr_dataset is not None and len(hr_dataset) == 400:
+                    valid_hr_count = (hr_dataset['hr_count'] > 0).sum()
+                    print(f"[HR-SETUP] Loaded {valid_hr_count}/400 valid HR examples")
+                    
+                    # Double-check consistency in report context
+                    try:
+                        consistent = hr.verify_dataset_consistency()
+                        if not consistent:
+                            print(f"[HR-SETUP] WARNING: HR dataset consistency issues detected")
+                            print(f"[HR-SETUP] This may affect Human Reasoning evaluation accuracy")
+                            if auto_generate_hr and hr_api_key:
+                                print(f"[HR-SETUP] Attempting auto-regeneration...")
+                                if generate_hr_ground_truth(hr_api_key):
+                                    hr_dataset = hr.load_ground_truth()
+                                    print(f"[HR-SETUP] HR dataset regenerated successfully")
+                                else:
+                                    print(f"[HR-SETUP] HR regeneration failed")
+                    except Exception as e:
+                        print(f"[HR-SETUP] Consistency check error: {e}")
+                else:
+                    print(f"[HR-SETUP] Failed to load HR dataset properly")
+                    hr_dataset = None
+                    metrics_to_compute = [m for m in metrics_to_compute if m != "human_reasoning"]
+                    print(f"[HR-SETUP] Removed human_reasoning from metrics")
+            else:
+                print(f"[HR-SETUP] Human Reasoning not available")
+                if auto_generate_hr and hr_api_key:
+                    print(f"[HR-SETUP] Auto-generation was attempted but failed")
+                else:
+                    print(f"[HR-SETUP] To enable: set auto_generate_hr=True and provide hr_api_key")
+                
+                # Remove HR from metrics
+                metrics_to_compute = [m for m in metrics_to_compute if m != "human_reasoning"]
+                print(f"[HR-SETUP] Removed human_reasoning from metrics")
+        
+        total_combinations = len(models_to_test) * len(explainers_to_test) * len(metrics_to_compute)
+        
+        print(f"\n[REPORT] Simplified Configuration (FIXED CONSISTENCY):")
+        print(f"  Models: {models_to_test}")
+        print(f"  Explainers: {explainers_to_test}")
+        print(f"  Metrics: {metrics_to_compute}")
+        print(f"  Sample size: {sample_size}")
+        print(f"  Total combinations: {total_combinations}")
+        print(f"  Optimizations: Cache={enable_caching}, Adaptive={adaptive_batching}")
+        if hr_dataset is not None:
+            print(f"  Human Reasoning: Available with {(hr_dataset['hr_count'] > 0).sum()} examples")
+        if "consistency" in metrics_to_compute:
+            print(f"  Consistency: FIXED - will return mean±std format")
+        
+        # FASE 1: Process each model sequentially
+        print(f"\n{'='*80}")
+        print("FASE 1: SIMPLIFIED MODEL PROCESSING + HR + FIXED CONSISTENCY")
+        print(f"{'='*80}")
+        
+        all_results = {}
+        
+        for i, model_key in enumerate(models_to_test, 1):
+            print(f"\n[{i}/{len(models_to_test)}] Model: {model_key}")
+            
+            # Resume logic with checkpoint validation
+            if resume:
+                print(f"[RESUME] Checking for existing checkpoint...")
+                existing = recovery.load_latest_checkpoint(f"model_{model_key}")
+                
+                if existing:
+                    is_complete, reason = verify_checkpoint_completeness(
+                        existing, metrics_to_compute, explainers_to_test
+                    )
+                    
+                    if is_complete:
+                        print(f"[RESUME] Using complete cached results for {model_key}")
+                        all_results[model_key] = existing
+                        continue
+                    else:
+                        print(f"[RESUME] Incomplete checkpoint: {reason}")
+            
+            try:
+                with Timer(f"Processing {model_key} (simplified + HR + fixed consistency)"):
+                    results = process_model_simplified(
+                        model_key=model_key,
+                        explainers_to_test=explainers_to_test,
+                        metrics_to_compute=metrics_to_compute,
+                        sample_size=sample_size,
+                        enable_caching=enable_caching,
+                        adaptive_batching=adaptive_batching,
+                        recovery=recovery,
+                        hr_dataset=hr_dataset  # Pass HR dataset
+                    )
+                    all_results[model_key] = {"results": results, "completed": True}
+                
+                print(f"[SUCCESS] {model_key} completed successfully")
+                
+            except Exception as e:
+                print(f"[ERROR] Model {model_key} failed: {e}")
+                all_results[model_key] = {
+                    "results": {metric: {} for metric in metrics_to_compute},
+                    "completed": False,
+                    "error": str(e)
+                }
+        
+        # FASE 2: Build tables (FIXED CONSISTENCY)
+        print(f"\n{'='*80}")
+        print("FASE 2: BUILDING SIMPLIFIED TABLES + HR + FIXED CONSISTENCY")
+        print(f"{'='*80}")
+        
+        profiler.start_operation("table_building")
+        tables = build_report_tables(all_results, metrics_to_compute)
+        profiler.end_operation("table_building")
+        
+        # FASE 2.5: DEBUG CONSISTENCY RESULTS
+        if "consistency" in metrics_to_compute:
+            print(f"\n[DEBUG] Verifying consistency results...")
+            debug_consistency_results(all_results)
+        
+        # FASE 3: Analysis & Output (FIXED CONSISTENCY)
+        print(f"\n{'='*80}")
+        print("FASE 3: SIMPLIFIED ANALYSIS & OUTPUT + HR + FIXED CONSISTENCY")
+        print(f"{'='*80}")
+        
+        execution_time = time.time() - start_time
+        
+        # Print tables with analysis
+        for metric_name, df in tables.items():
+            if not df.empty:
+                print(f"\n {metric_name.upper()} TABLE (FIXED):")
+                print("=" * 50)
+                
+                # SPECIAL FORMATTING FOR CONSISTENCY
+                if metric_name == "consistency":
+                    print(df.to_string(na_rep="—"))  # Don't force float format for consistency
+                else:
+                    print(df.to_string(float_format="%.4f", na_rep="—"))
+                
+                # Save CSV
+                csv_file = RESULTS_DIR / f"{metric_name}_table_simplified_fixed.csv"
+                df.to_csv(csv_file)
+                print(f"[SAVE] CSV saved: {csv_file}")
+                
+                # Analysis (FIXED for consistency)
+                print_table_analysis(df, metric_name)
+        
+        profiler.end_operation("simplified_report")
+        
+        # Final summary
+        print(f"\n{'='*80}")
+        print(" SIMPLIFIED REPORT + HR + FIXED CONSISTENCY COMPLETED!")
+        print(f"{'='*80}")
+        print(f"  Total time: {execution_time/60:.1f} minutes")
+        print(f"  Models processed: {len([r for r in all_results.values() if r.get('completed', False)])}/{len(models_to_test)}")
+        print(f"  Tables generated: {len([t for t in tables.values() if not t.empty])}")
+        print(f"  Files saved in: {RESULTS_DIR}")
+        print(f"  Total data points: {sum(df.notna().sum().sum() for df in tables.values())}")
+        
+        # Consistency specific summary
+        if "consistency" in metrics_to_compute and "consistency" in tables:
+            consistency_table = tables["consistency"]
+            if not consistency_table.empty:
+                # Parse consistency values for summary
+                all_means = []
+                for explainer in consistency_table.index:
+                    for model in consistency_table.columns:
+                        value = consistency_table.loc[explainer, model]
+                        if isinstance(value, str) and "±" in value:
+                            try:
+                                mean_part = value.split("±")[0]
+                                all_means.append(float(mean_part))
+                            except ValueError:
+                                continue
+                
+                if all_means:
+                    overall_mean = np.mean(all_means)
+                    overall_std = np.std(all_means)
+                    print(f"  Consistency overall: {overall_mean:.4f}±{overall_std:.4f} (mean±std format FIXED)")
+        
+        # Human Reasoning specific summary
+        if "human_reasoning" in metrics_to_compute and "human_reasoning" in tables:
+            hr_table = tables["human_reasoning"]
+            if not hr_table.empty:
+                hr_mean = hr_table.stack().mean()
+                print(f"  Human Reasoning avg: {hr_mean:.4f} (MAP score)")
+        
+        # Performance summary
+        profiler.print_summary()
+        
+        # GOOGLE DRIVE BACKUP AUTOMATICO
+        if not no_backup:
+            try:
+                backup_results_to_drive(str(RESULTS_DIR), drive_folder)
+            except Exception as e:
+                print(f"[DRIVE] Backup failed: {e}")
+                print("[DRIVE] Trying quick CSV backup...")
+                try:
+                    quick_drive_backup(str(RESULTS_DIR))
+                except:
+                    print("[DRIVE] Quick backup also failed")
+        
+        return tables
+        
+    except Exception as e:
+        print(f"\nSIMPLIFIED REPORT + HR + FIXED CONSISTENCY FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+
+def turbo_report(sample_size: int = 50, include_hr: bool = False, hr_api_key: Optional[str] = None) -> Dict[str, pd.DataFrame]:
+    """Report ultra-veloce con architettura semplificata + opzionale Human Reasoning + FIXED CONSISTENCY."""
+    print_simplified_header()
+    print("[TURBO] Ultra-fast report with simplified architecture + optional HR + FIXED CONSISTENCY")
+    
+    # Configuration for maximum speed
+    models_subset = ["tinybert", "distilbert"]  # Fastest models
+    explainers_subset = ["lime", "grad_input"]  # Fast explainers
+    
+    if include_hr:
+        metrics_subset = ["robustness", "consistency", "human_reasoning"]  # Include HR + consistency
+    else:
+        metrics_subset = ["robustness", "consistency"]  # Include consistency for testing
+    
+    return run_simplified_report(
+        models_to_test=models_subset,
+        explainers_to_test=explainers_subset,
+        metrics_to_compute=metrics_subset,
+        sample_size=sample_size,
+        enable_caching=True,
+        adaptive_batching=True,
+        resume=True,
+        hr_api_key=hr_api_key,
+        auto_generate_hr=include_hr
+    )
+
+def get_available_resources():
+    """Ottieni risorse disponibili per report."""
+    available_models = list(models.MODELS.keys())
+    available_explainers = [exp for exp in EXPLAINERS if exp in explainers.list_explainers()]
+    
+    print(f"[RESOURCES] Models: {len(available_models)} available")
+    print(f"[RESOURCES] Explainers: {len(available_explainers)} available")
+    print(f"[RESOURCES] Metrics: {len(METRICS)} available (including Human Reasoning)")
+    print(f"[RESOURCES] Dataset: {len(dataset.test_df)} clustered examples")
+    
+    hr_info = hr.get_info()
+    if hr_info['available']:
+        consistency_status = ""
+        if hr_info.get('exact_match_dataset', False):
+            consistency_status = " (CONSISTENT)"
+        else:
+            # Quick check
+            try:
+                consistent = hr.verify_dataset_consistency()
+                consistency_status = " (VERIFIED)" if consistent else " (INCONSISTENT)"
+            except:
+                consistency_status = " (UNKNOWN)"
+        
+        print(f"[RESOURCES] Human Reasoning: {hr_info['valid_examples']}/400 examples{consistency_status}")
+    else:
+        print(f"[RESOURCES] Human Reasoning: Not available (can be generated with fixed version)")
+    
+    print(f"[RESOURCES] Consistency: FIXED - returns mean±std format")
+    
+    return available_models, available_explainers
+
+# Alias per compatibilità
+run_optimized_report = run_simplified_report
+
+# =============================================================================
+# CLI INTERFACE (UPDATED)
+# =============================================================================
+
+def main():
+    """Main CLI entry point (with HR fixes + CONSISTENCY FIXES)."""
+    parser = argparse.ArgumentParser(description="XAI Report Generator - Simplified Version + Human Reasoning + FIXED CONSISTENCY")
+    parser.add_argument("--models", nargs="+", choices=list(models.MODELS.keys()), 
+                       default=None, help="Models to test")
+    parser.add_argument("--explainers", nargs="+", choices=EXPLAINERS,
+                       default=None, help="Explainers to test")
+    parser.add_argument("--metrics", nargs="+", choices=METRICS,
+                       default=None, help="Metrics to compute (includes human_reasoning + FIXED consistency)")
+    parser.add_argument("--sample", type=int, default=100, help="Sample size")
+    parser.add_argument("--turbo", action="store_true", help="Ultra-fast turbo report")
+    parser.add_argument("--no-cache", action="store_true", help="Disable caching")
+    parser.add_argument("--no-adaptive", action="store_true", help="Disable adaptive batching")
+    parser.add_argument("--resume", action="store_true", default=True, help="Resume from checkpoints")
+    parser.add_argument("--no-resume", dest="resume", action="store_false", help="Start fresh")
+    parser.add_argument("--drive-folder", default="XAI_Results", help="Google Drive folder name")
+    parser.add_argument("--no-backup", action="store_true", help="Disable automatic backup")
+    
+    # Human Reasoning arguments
+    parser.add_argument("--hr-api-key", help="OpenRouter API key for Human Reasoning")
+    parser.add_argument("--auto-generate-hr", action="store_true", help="Auto-generate HR if missing")
+    parser.add_argument("--include-hr", action="store_true", help="Include HR in turbo mode")
+    parser.add_argument("--hr-status", action="store_true", help="Check HR status and exit")
+    parser.add_argument("--hr-generate", action="store_true", help="Generate HR ground truth and exit")
+    parser.add_argument("--hr-verify", action="store_true", help="Verify HR dataset consistency")
+    
+    # Consistency testing arguments (NEW)
+    parser.add_argument("--test-consistency", action="store_true", help="Test consistency format and exit")
+    
+    args = parser.parse_args()
+    
+    # Handle testing commands first
+    if args.test_consistency:
+        test_consistency_format()
+        return
+    
+    # Handle HR-specific commands
+    if args.hr_verify:
+        print("Verifying HR dataset consistency...")
+        try:
+            consistent = hr.verify_dataset_consistency()
+            if consistent:
+                print(" VERIFICATION PASSED - HR dataset matches clustered dataset exactly")
+            else:
+                print(" VERIFICATION FAILED - HR dataset has inconsistencies")
+                print("Recommendation: Regenerate HR dataset with --hr-generate")
+                sys.exit(1)
+        except Exception as e:
+            print(f" VERIFICATION ERROR: {e}")
+            sys.exit(1)
+        return
+    
+    if args.hr_status:
+        check_hr_status()
+        return
+    
+    if args.hr_generate:
+        if not args.hr_api_key:
+            print("[ERROR] HR API key required for generation")
+            print("Get your key from: https://openrouter.ai/")
+            sys.exit(1)
+        success = generate_hr_ground_truth(args.hr_api_key)
+        sys.exit(0 if success else 1)
+    
+    print("XAI BENCHMARK - SIMPLIFIED VERSION + HUMAN REASONING + FIXED CONSISTENCY")
+    print("="*70)
+    print("Simplifications:")
+    print("- Sequential explainer processing")
+    print("- Removed parallelization complexity") 
+    print("- Focus on high-impact optimizations")
+    print("Optimizations:")
+    print("- Adaptive batch sizing")
+    print("- Intelligent caching")
+    print("- Advanced memory management")
+    print("- GPU optimizations")
+    print("- Async I/O operations")
+    print("Human Reasoning:")
+    print("- LLM-generated importance rankings")
+    print("- Mean Average Precision evaluation")
+    print("- Optional auto-generation")
+    print("Consistency FIXES:")
+    print("- Returns mean±std format properly")
+    print("- Fixed double assignment bug")
+    print("- Improved analysis and ranking")
+    print("="*70)
+    
+    if args.turbo:
+        print("Running turbo report (FIXED CONSISTENCY)...")
+        tables = turbo_report(
+            sample_size=min(args.sample, 50),
+            include_hr=args.include_hr,
+            hr_api_key=args.hr_api_key
+        )
+    else:
+        print("Running simplified report (FIXED CONSISTENCY)...")
+        tables = run_simplified_report(
+            models_to_test=args.models,
+            explainers_to_test=args.explainers,
+            metrics_to_compute=args.metrics,
+            sample_size=args.sample,
+            enable_caching=not args.no_cache,
+            adaptive_batching=not args.no_adaptive,
+            resume=args.resume,
+            drive_folder=args.drive_folder,
+            no_backup=args.no_backup,
+            hr_api_key=args.hr_api_key,
+            auto_generate_hr=args.auto_generate_hr
+        )
+    
+    if not any(not df.empty for df in tables.values()):
+        print("No results generated!")
+        sys.exit(1)
+    else:
+        print("Simplified report + HR + FIXED CONSISTENCY completed successfully!")
+        
+        # Final consistency verification
+        if "consistency" in tables and not tables["consistency"].empty:
+            print("\n[FINAL CHECK] Consistency table verification:")
+            consistency_df = tables["consistency"]
+            sample_value = None
+            
+            for explainer in consistency_df.index:
+                for model in consistency_df.columns:
+                    value = consistency_df.loc[explainer, model]
+                    if isinstance(value, str) and "±" in value:
+                        sample_value = value
+                        break
+                if sample_value:
+                    break
+            
+            if sample_value:
+                print(f"Sample consistency value: {sample_value} (mean±std format confirmed)")
+            else:
+                print("No mean±std format found in consistency table")
+
+if __name__ == "__main__":
+    main()

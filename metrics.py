@@ -484,24 +484,23 @@ def compute_contrastivity(
 def compute_human_reasoning_score(xai_tokens: List[str], xai_scores: List[float], 
                                 hr_ranking: List[str]) -> float:
     """
-    Calcola Human Reasoning Agreement usando Mean Average Precision (MAP) - OTTIMIZZATO TOP-4
+    Calcola Human Reasoning Agreement usando Mean Average Precision (MAP) - VERSIONE CORRETTA
+    
+    CORREZIONI IMPLEMENTATE:
+    1. Rimossa limitazione TOP-4 artificiale  
+    2. Usa tutto il ranking HR (5-8 parole come da prompt)
+    3. Denominatore corretto per MAP
     """
     if not hr_ranking or not xai_tokens or not xai_scores:
         return 0.0
     
-    #  OTTIMIZZAZIONE TOP-4: Usa solo le prime 4 parole più importanti
-    TOP_K = 4
-    hr_ranking_top4 = hr_ranking[:min(TOP_K, len(hr_ranking))]
-    
-    if not hr_ranking_top4:
-        return 0.0
-    
+    # CORREZIONE: USA TUTTO IL RANKING HR (non solo top-4!)
     # Ordina XAI tokens per score (decrescente)
     xai_ranking = [token.lower() for token, score in 
                   sorted(zip(xai_tokens, xai_scores), key=lambda x: x[1], reverse=True)]
     
-    # Normalizza HR ranking (solo top-4)
-    hr_set = set(word.lower() for word in hr_ranking_top4)
+    # CORREZIONE: Normalizza HR ranking (TUTTE le 5-8 parole)
+    hr_set = set(word.lower() for word in hr_ranking)
     
     # Calcola Average Precision
     relevant_count = 0
@@ -513,9 +512,67 @@ def compute_human_reasoning_score(xai_tokens: List[str], xai_scores: List[float]
             precision_at_k = relevant_count / k
             precision_sum += precision_at_k
     
-    #  DENOMINATORE TOP-4: Normalizza per le top-4 parole invece di len(hr_ranking)
-    ap = precision_sum / len(hr_ranking_top4) if hr_ranking_top4 else 0.0
+    # CORREZIONE: DENOMINATORE CORRETTO - usa tutto il ranking HR
+    ap = precision_sum / len(hr_ranking) if hr_ranking else 0.0
     return ap
+
+def debug_hr_calculation(xai_tokens: List[str], xai_scores: List[float], 
+                        hr_ranking: List[str], text_sample: str = "") -> dict:
+    """
+    Debug dettagliato del calcolo Human Reasoning per identificare problemi.
+    """
+    print(f"\n{'='*60}")
+    print("DEBUG HUMAN REASONING CALCULATION")
+    print(f"{'='*60}")
+    
+    if text_sample:
+        print(f"Text: {text_sample[:100]}...")
+    
+    print(f"HR Ranking ({len(hr_ranking)} words): {hr_ranking}")
+    print(f"XAI Tokens (first 10): {xai_tokens[:10]}")
+    print(f"XAI Scores (first 10): {[f'{s:.3f}' for s in xai_scores[:10]]}")
+    
+    # Ordina XAI
+    xai_ranking = [token.lower() for token, score in 
+                  sorted(zip(xai_tokens, xai_scores), key=lambda x: x[1], reverse=True)]
+    print(f"XAI Ranking (first 15): {xai_ranking[:15]}")
+    
+    # Trova match
+    hr_set = set(word.lower() for word in hr_ranking)
+    matches_found = []
+    for k, xai_word in enumerate(xai_ranking[:30], 1):
+        if xai_word in hr_set:
+            matches_found.append((k, xai_word))
+    
+    print(f"Matches found in top 30: {matches_found}")
+    
+    # Calcola AP
+    relevant_count = 0
+    precision_sum = 0
+    
+    for k, xai_word in enumerate(xai_ranking, 1):
+        if xai_word in hr_set:
+            relevant_count += 1
+            precision_at_k = relevant_count / k
+            precision_sum += precision_at_k
+            print(f"  Match at k={k}: '{xai_word}' -> P@{k} = {precision_at_k:.4f}")
+    
+    # Risultati finali
+    ap_new = precision_sum / len(hr_ranking) if hr_ranking else 0.0
+    ap_old = precision_sum / 4 if len(hr_ranking) >= 4 else 0.0  # Vecchio metodo
+    
+    print(f"\nResults:")
+    print(f"  AP (OLD TOP-4): {ap_old:.4f}")
+    print(f"  AP (NEW FULL):  {ap_new:.4f}")
+    print(f"  Improvement: {ap_new/ap_old:.1f}x" if ap_old > 0 else "")
+    print(f"  Expected range: 0.2-0.4 (literature)")
+    
+    return {
+        "ap_old": ap_old,
+        "ap_new": ap_new,
+        "matches": matches_found,
+        "improvement": ap_new/ap_old if ap_old > 0 else float('inf')
+    }
 
 def evaluate_human_reasoning_over_dataset(
     model: PreTrainedModel,

@@ -1,8 +1,7 @@
 """
-models.py – Gestione modelli pre-trained per sentiment analysis (GOOGLE COLAB)
+models.py – Gestione modelli pre-trained per sentiment analysis 
 ============================================================
 
-Versione ottimizzata per Google Colab con GPU.
 Assume sempre ambiente Colab con GPU disponibile.
 """
 

@@ -63,7 +63,6 @@ Three evaluation metrics:
 #### Robustness
 Measures stability under perturbations:
 - Random masking, deletion, substitution
-- Spearman correlation of attributions
 - Lower scores indicate higher robustness
 
 #### Consistency 

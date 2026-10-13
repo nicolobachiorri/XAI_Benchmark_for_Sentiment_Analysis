@@ -1,533 +1,411 @@
 """
-report.py – Report XAI essenziale con --sample configurabile
-====================================================================
+report.py – Benchmark completo: 5 modelli × 6 explainer × 3 metriche (cap. 3-4)
+===============================================================================
 
-- Solo report completi con sample size configurabile
-- 3 metriche core: robustness, consistency, contrastivity
-- CLI semplificata: python report.py --sample 400
+Esempi
+------
+    # stima dei tempi sull'hardware in uso (pochi minuti), da lanciare prima del run
+    python report.py --estimate
 
-Uso:
-```bash
-python report.py --sample 400 --models tinybert distilbert --metrics robustness consistency
-python report.py --sample 200 --explainers lime shap grad_input
-```
+    # run completo come nella tesi (400 testi, tutte le metriche)
+    python report.py --out-dir runs/v2
+
+    # solo alcuni modelli/explainer, per esempio Attention Flow su un runtime CPU
+    python report.py --explainers attention_flow --device cpu --flow-workers 2
+
+Il run si può interrompere e rilanciare con lo stesso comando: ogni testo
+completato è salvato subito (file .jsonl) e viene saltato alla ripresa.
+
+Per ogni coppia (modello, explainer):
+1. modello in eval(), seed 42: spiegazione del testo originale e delle 6
+   perturbazioni (robustness); la spiegazione originale serve anche alla contrastivity;
+2. modello in train() (dropout attivo): 4 spiegazioni con seed 42, 123, 456, 789
+   (consistency).
+
+Output in --out-dir:
+    <modello>/<explainer>/eval.jsonl, train.jsonl   valori per testo
+    <modello>/<explainer>/summary.json              metriche aggregate e conteggi
+    robustness_table.csv, consistency_table.csv, contrastivity_table.csv
+    run_metadata.json                               configurazione, versioni, commit
 """
 
 import argparse
-import gc
-import json
-import time
+import hashlib
+import platform
 import sys
-import os
-import shutil
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
-from collections import defaultdict
-from datetime import datetime
+from typing import Dict, List, Optional
 
-import pandas as pd
 import numpy as np
-import torch
-from tqdm.auto import tqdm
+import pandas as pd
 
-import models
 import dataset
-import explainers
 import metrics
-from utils import Timer, set_seed, aggressive_cleanup
-
-# =============================================================================
-# CONFIGURAZIONE CORE
-# =============================================================================
+from attribution import Attribution, normalize_whitespace
+from utils import Timer, append_jsonl, format_time, git_commit, read_jsonl, save_json, set_seed
 
 EXPLAINERS = ["lime", "shap", "grad_input", "attention_rollout", "attention_flow", "lrp"]
-METRICS = ["robustness", "contrastivity", "consistency"]
-DEFAULT_CONSISTENCY_SEEDS = [42, 123, 456, 789]
+METRICS = ["robustness", "consistency", "contrastivity"]
+MODEL_ORDER = ["tinybert", "distilbert", "roberta-base", "bert-large", "roberta-large"]
+FAIL_FAST_AFTER = 3  # errori consecutivi iniziali dopo cui un explainer viene fermato
 
-RESULTS_DIR = Path("xai_results")
-RESULTS_DIR.mkdir(exist_ok=True)
-
-set_seed(42)
 
 # =============================================================================
-# BASIC MEMORY MANAGEMENT
+# Preparazione dei testi
 # =============================================================================
+def prepare_texts(tokenizer, raw_texts: List[str], max_length: int) -> List[str]:
+    """Spazi singoli e troncamento alle parole che entrano in `max_length` token."""
+    from explainers import visible_text
+    return [visible_text(normalize_whitespace(t), tokenizer, max_length) for t in raw_texts]
 
-def basic_cleanup():
-    """Cleanup memoria essenziale."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
-def calculate_optimal_batch_size(base_batch_size: int = 10) -> int:
-    """Calcola batch size ottimale basato su memoria."""
-    try:
-        import psutil
-        available_gb = psutil.virtual_memory().available / (1024**3)
-        
-        if available_gb > 8:
-            return base_batch_size * 4  # 40
-        elif available_gb > 4:
-            return base_batch_size * 2  # 20
-        elif available_gb > 2:
-            return base_batch_size      # 10
-        else:
-            return max(2, base_batch_size // 2)  # 5
-    except ImportError:
-        return base_batch_size
+def run_signature(explainer_name: str, texts: List[str], labels: List[int], cfg) -> dict:
+    """Tutto ciò che determina i risultati di una cartella: testi, parametri, seed.
+    Serve a non mescolare, alla ripresa, risultati ottenuti con impostazioni diverse."""
+    c = vars(cfg) if cfg is not None else {}
+    relevant = {k: c.get(k) for k in ("max_length", "lime_samples", "shap_samples", "amp")}
+    if explainer_name == "attention_flow":
+        relevant["flow_max_length"] = c.get("flow_max_length")
+    return {"explainer": explainer_name,
+            "texts_sha256": hashlib.sha256("\n".join(texts).encode()).hexdigest(),
+            "labels_sha256": hashlib.sha256(",".join(map(str, labels)).encode()).hexdigest(),
+            "config": relevant, "consistency_seeds": metrics.CONSISTENCY_SEEDS,
+            "perturbation_ratio": metrics.PERTURBATION_RATIO,
+            "perturbations_per_type": metrics.N_PERTURBATIONS_PER_TYPE,
+            "explanation_seed": metrics.EXPLANATION_SEED}
+
+
+def _check_signature(out_dir: Path, sig: dict, resume: bool) -> None:
+    from utils import load_json
+    path = out_dir / "signature.json"
+    old = load_json(path)
+    has_results = (out_dir / "eval.jsonl").exists() or (out_dir / "train.jsonl").exists()
+    if resume and old is not None and old != sig and has_results:
+        diff = sorted(k for k in set(old) | set(sig) if old.get(k) != sig.get(k))
+        raise RuntimeError(f"{out_dir} contiene risultati ottenuti con impostazioni diverse ({', '.join(diff)}): "
+                           "usa un'altra --out-dir oppure --no-resume")
+    save_json(path, sig)
+
+
+def _done_rows(path: Path, needed_key: Optional[str] = None, skip_errors: bool = False) -> Dict[int, dict]:
+    """Ultima riga salvata per ogni testo. Con skip_errors le righe con errori sono
+    considerate da rifare (per esempio dopo un out-of-memory)."""
+    rows = {}
+    for r in read_jsonl(path):
+        if needed_key is not None and needed_key not in r:
+            continue
+        if skip_errors and (r.get("error") or r.get("errors")):
+            continue
+        rows[r["i"]] = r
+    return rows
+
 
 # =============================================================================
-# CORE PROCESSING FUNCTION
+# Un explainer su un modello
 # =============================================================================
+def run_explainer(model, tokenizer, explainer_name: str, texts: List[str], labels: List[int],
+                  metrics_to_compute: List[str], cfg, out_dir: Path, resume: bool = True) -> dict:
+    import explainers
+    out_dir.mkdir(parents=True, exist_ok=True)
+    eval_path, train_path = out_dir / "eval.jsonl", out_dir / "train.jsonl"
+    if not resume:
+        for p in (eval_path, train_path):
+            p.unlink(missing_ok=True)
 
-def process_model_core(
-    model_key: str,
-    explainers_to_test: List[str],
-    metrics_to_compute: List[str],
-    sample_size: int
-) -> Dict[str, Dict[str, float]]:
-    """Processa singolo modello con architettura semplificata."""
-    
-    print(f"\n{'='*70}")
-    print(f" PROCESSING MODEL: {model_key}")
-    print(f"{'='*70}")
-    
-    try:
-        # Carica modello
-        print(f"[LOAD] Loading {model_key}...")
-        with Timer(f"Loading {model_key}"):
-            model = models.load_model(model_key)
-            tokenizer = models.load_tokenizer(model_key)
-        
-        # Calcola batch size
-        optimal_batch_size = calculate_optimal_batch_size()
-        print(f"[BATCH] Optimal batch size: {optimal_batch_size}")
-        
-        # Prepara dati
-        print(f"[DATA] Preparing data (sample_size={sample_size})...")
-        texts, labels = dataset.get_clustered_sample(sample_size, stratified=True)
-        
-        # Separa dati per metriche
-        pos_texts = [t for t, l in zip(texts, labels) if l == 1][:optimal_batch_size]
-        neg_texts = [t for t, l in zip(texts, labels) if l == 0][:optimal_batch_size]
-        consistency_texts = texts[:min(optimal_batch_size, len(texts))]
-        
-        print(f"[DATA] Batch sizes - Pos: {len(pos_texts)}, Neg: {len(neg_texts)}, Consistency: {len(consistency_texts)}")
-        
-        # Inizializza risultati
-        results = {}
-        for metric in metrics_to_compute:
-            results[metric] = {}
-            for explainer in explainers_to_test:
-                if metric == "consistency":
-                    results[metric][explainer] = "NaN±NaN"
-                else:
-                    results[metric][explainer] = float('nan')
-        
-        # Processing sequenziale
-        print(f"\n[PROCESSING] Sequential processing of {len(explainers_to_test)} explainers...")
-        
-        successful_explainers = 0
-        
-        for i, explainer_name in enumerate(explainers_to_test, 1):
-            print(f"\n[{i}/{len(explainers_to_test)}] Processing {explainer_name}...")
-            print("-" * 50)
-            
-            explainer_success = False
-            
+    _check_signature(out_dir, run_signature(explainer_name, texts, labels, cfg), resume)
+    explain = explainers.get_explainer(explainer_name, model, tokenizer, cfg)
+    mask_token = tokenizer.mask_token or tokenizer.unk_token
+    timings = {}
+
+    # ---- 1. eval: robustness + spiegazioni per la contrastivity ----
+    need_eval = any(m in metrics_to_compute for m in ("robustness", "contrastivity"))
+    need_rob = "robustness" in metrics_to_compute
+    if need_eval:
+        model.eval()
+        done = _done_rows(eval_path, "robustness" if need_rob else None, skip_errors=True)
+        todo = [i for i in range(len(texts)) if i not in done]
+        print(f"  [eval] {len(done)} testi già fatti, {len(todo)} da fare")
+        t0, ok, consecutive_err = time.time(), 0, 0
+        for n, i in enumerate(todo, 1):
+            row = {"i": i, "label": labels[i]}
             try:
-                # Crea explainer
-                explainer = explainers.get_explainer(explainer_name, model, tokenizer)
-                
-                # Processa ogni metrica
-                for metric_name in metrics_to_compute:
-                    print(f"  [METRIC] {metric_name}...", end=" ")
-                    
-                    try:
-                        if metric_name == "robustness":
-                            score = metrics.evaluate_robustness_over_dataset(
-                                model, tokenizer, explainer, consistency_texts, show_progress=False
-                            )
-                            results[metric_name][explainer_name] = score
-                            
-                        elif metric_name == "contrastivity":
-                            # Process in batch
-                            pos_attrs = metrics.process_attributions_batch(
-                                pos_texts, explainer, batch_size=optimal_batch_size//2, show_progress=False
-                            )
-                            neg_attrs = metrics.process_attributions_batch(
-                                neg_texts, explainer, batch_size=optimal_batch_size//2, show_progress=False
-                            )
-                            
-                            # Filter valid
-                            pos_attrs = [attr for attr in pos_attrs if attr.tokens and attr.scores]
-                            neg_attrs = [attr for attr in neg_attrs if attr.tokens and attr.scores]
-                            
-                            if pos_attrs and neg_attrs:
-                                score = metrics.compute_contrastivity(pos_attrs, neg_attrs)
-                            else:
-                                score = 0.0
-                            
-                            results[metric_name][explainer_name] = score
-                                
-                        elif metric_name == "consistency":
-                            # Usa la logica corretta
-                            mean_score, std_score = metrics.evaluate_consistency_over_dataset(
-                                model=model,
-                                tokenizer=tokenizer,
-                                explainer=explainer,
-                                texts=consistency_texts,
-                                seeds=DEFAULT_CONSISTENCY_SEEDS,
-                                show_progress=False
-                            )
-                            
-                            # Crea stringa formattata
-                            formatted_score = f"{mean_score:.4f}±{std_score:.4f}"
-                            results[metric_name][explainer_name] = formatted_score
-                            score = mean_score
-                        
-                        print(f" SUCCESS {score:.4f}")
-                        explainer_success = True
-                        
-                    except Exception as e:
-                        print(f"ERROR: {str(e)[:50]}...")
-                        if metric_name == "consistency":
-                            results[metric_name][explainer_name] = "NaN±NaN"
-                        else:
-                            results[metric_name][explainer_name] = float('nan')
-                
-                if explainer_success:
-                    successful_explainers += 1
-                
-                # Cleanup explainer
-                del explainer
-                basic_cleanup()
-                
+                set_seed(metrics.EXPLANATION_SEED)
+                orig = explain(texts[i])
+                row["attr"] = orig.to_dict()
+                if need_rob:
+                    perts = metrics.make_perturbations(texts[i], text_seed=i, mask_token=mask_token)
+                    row["robustness"] = metrics.robustness_for_text(explain, texts[i], orig, perts, set_seed=set_seed)
+                ok += 1
+                consecutive_err = 0
             except Exception as e:
-                print(f"  EXPLAINER FAILED: {explainer_name}: {e}")
-                for metric in metrics_to_compute:
-                    if metric == "consistency":
-                        results[metric][explainer_name] = "NaN±NaN"
-                    else:
-                        results[metric][explainer_name] = float('nan')
-        
-        print(f"\n[COMPLETE] {model_key} processing completed")
-        print(f"[STATS] Successful explainers: {successful_explainers}/{len(explainers_to_test)}")
-        
-        return results
-        
-    except Exception as e:
-        print(f"[ERROR] Model {model_key} processing failed: {e}")
-        
-        # Restituisci struttura vuota ma valida
-        empty_results = {}
-        for metric in metrics_to_compute:
-            empty_results[metric] = {}
-            for explainer in explainers_to_test:
-                if metric == "consistency":
-                    empty_results[metric][explainer] = "NaN±NaN"
+                row["error"] = f"{type(e).__name__}: {e}"[:300]
+                if need_rob:
+                    row["robustness"] = {"robustness": None, "perturbations": []}
+                consecutive_err += 1
+            append_jsonl(eval_path, row)
+            if ok == 0 and consecutive_err >= FAIL_FAST_AFTER:
+                raise RuntimeError(f"{explainer_name}: i primi {consecutive_err} testi falliscono: {row['error']}")
+            if n % 25 == 0 or n == len(todo):
+                el = time.time() - t0
+                print(f"  [eval] {n}/{len(todo)}  {format_time(el)}  (stima residua {format_time(el / n * (len(todo) - n))})")
+        timings["eval_seconds_this_run"] = time.time() - t0
+
+    # ---- 2. train: consistency con dropout attivo ----
+    if "consistency" in metrics_to_compute:
+        done = _done_rows(train_path, skip_errors=True)
+        todo = [i for i in range(len(texts)) if i not in done]
+        print(f"  [train] {len(done)} testi già fatti, {len(todo)} da fare")
+        model.train()
+        try:
+            t0, ok, consecutive_err = time.time(), 0, 0
+            for n, i in enumerate(todo, 1):
+                res = metrics.consistency_for_text(explain, texts[i], metrics.CONSISTENCY_SEEDS, set_seed=set_seed)
+                res["i"] = i
+                if res["errors"]:
+                    consecutive_err += 1
                 else:
-                    empty_results[metric][explainer] = float('nan')
-        
-        return empty_results
-        
-    finally:
-        # Cleanup finale
-        print(f"[CLEANUP] Final cleanup for {model_key}...")
-        aggressive_cleanup()
+                    ok += 1
+                    consecutive_err = 0
+                append_jsonl(train_path, res)
+                if ok == 0 and consecutive_err >= FAIL_FAST_AFTER:
+                    raise RuntimeError(f"{explainer_name}: consistency fallisce: {res['errors'][0]}")
+                if n % 25 == 0 or n == len(todo):
+                    el = time.time() - t0
+                    print(f"  [train] {n}/{len(todo)}  {format_time(el)}  (stima residua {format_time(el / n * (len(todo) - n))})")
+            timings["train_seconds_this_run"] = time.time() - t0
+        finally:
+            model.eval()
+
+    summary = summarize(eval_path, train_path, len(texts), metrics_to_compute, mask_token)
+    summary["timings"] = timings
+    save_json(out_dir / "summary.json", summary)
+    return summary
+
+
+def summarize(eval_path: Path, train_path: Path, n_texts: int, metrics_to_compute: List[str],
+              mask_token: str) -> dict:
+    out = {"n_texts": n_texts}
+    ev = {i: r for i, r in _done_rows(eval_path).items() if i < n_texts}
+    out["n_eval_errors"] = sum(1 for r in ev.values() if "error" in r)
+    if "robustness" in metrics_to_compute:
+        per_text = [ev[i]["robustness"]["robustness"] if i in ev and "robustness" in ev[i] else None
+                    for i in range(n_texts)]
+        agg = metrics.aggregate_robustness(per_text)
+        statuses = {}
+        for r in ev.values():
+            for p in r.get("robustness", {}).get("perturbations", []):
+                key = p["status"] if not p["status"].startswith("error") else "error"
+                statuses[key] = statuses.get(key, 0) + 1
+        agg["perturbation_status"] = statuses
+        out["robustness"] = agg
+    if "contrastivity" in metrics_to_compute:
+        pos = [Attribution.from_dict(r["attr"]) for r in ev.values() if "attr" in r and r["label"] == 1]
+        neg = [Attribution.from_dict(r["attr"]) for r in ev.values() if "attr" in r and r["label"] == 0]
+        out["contrastivity"] = metrics.contrastivity(pos, neg, exclude=[mask_token])
+    if "consistency" in metrics_to_compute:
+        tr = {i: r for i, r in _done_rows(train_path).items() if i < n_texts}
+        per_text = [tr[i]["consistency"] if i in tr else None for i in range(n_texts)]
+        agg = metrics.aggregate_consistency(per_text)
+        agg["n_invalid_pairs"] = sum(sum(1 for c in r["pair_correlations"] if c is None) for r in tr.values())
+        agg["n_errors"] = sum(len(r["errors"]) for r in tr.values())
+        out["consistency"] = agg
+    return out
+
 
 # =============================================================================
-# TABLE BUILDING
+# Tabelle
 # =============================================================================
-
-def build_report_tables(all_results: Dict[str, Dict], metrics_to_compute: List[str]) -> Dict[str, pd.DataFrame]:
-    """Costruisce tabelle finali dai risultati."""
-    print(f"\n{'='*70}")
-    print(" BUILDING REPORT TABLES")
-    print(f"{'='*70}")
-    
+def build_tables(out_root: Path, models_: List[str], explainers_: List[str]) -> Dict[str, pd.DataFrame]:
+    rows = {m: {} for m in METRICS}
+    for mk in models_:
+        for ex in explainers_:
+            s = _load_summary(out_root / mk / ex / "summary.json")
+            if not s:
+                continue
+            if s.get("robustness"):
+                rows["robustness"].setdefault(ex, {})[mk] = s["robustness"]["mean"]
+            if s.get("contrastivity"):
+                rows["contrastivity"].setdefault(ex, {})[mk] = s["contrastivity"]["contrastivity"]
+            if s.get("consistency") and s["consistency"]["mean"] is not None:
+                c = s["consistency"]
+                rows["consistency"].setdefault(ex, {})[mk] = f"{c['mean']:.4f}±{(c['std'] or 0):.4f}"
     tables = {}
-    
-    for metric in metrics_to_compute:
-        print(f"\n[TABLE] Building {metric} table...")
-        
-        metric_data = defaultdict(dict)
-        
-        for model_key, model_data in all_results.items():
-            if "results" not in model_data:
-                continue
-                
-            if metric not in model_data["results"]:
-                continue
-                
-            explainer_scores = model_data["results"][metric]
-            
-            for explainer_name, score in explainer_scores.items():
-                if score is not None:
-                    if metric == "consistency" and isinstance(score, str) and "±" in score:
-                        # Mantieni formato stringa per consistency
-                        metric_data[explainer_name][model_key] = score
-                    elif not (isinstance(score, float) and np.isnan(score)):
-                        metric_data[explainer_name][model_key] = score
-        
-        if metric_data:
-            df = pd.DataFrame(metric_data).T
-            tables[metric] = df
-            print(f"[TABLE] {metric}: {df.shape[0]} explainers × {df.shape[1]} models")
-        else:
-            print(f"[TABLE] {metric}: No data available")
-            tables[metric] = pd.DataFrame()
-    
+    for m, data in rows.items():
+        df = pd.DataFrame(data).T if data else pd.DataFrame()
+        if not df.empty:
+            df = df.reindex(index=[e for e in explainers_ if e in df.index],
+                            columns=[k for k in models_ if k in df.columns])
+            df.to_csv(out_root / f"{m}_table.csv")
+        tables[m] = df
     return tables
 
-def print_table_analysis(df: pd.DataFrame, metric_name: str):
-    """Analisi e interpretazione tabella."""
-    print(f"\n{'='*60}")
-    print(f" {metric_name.upper()} ANALYSIS")
-    print(f"{'='*60}")
-    
-    if df.empty:
-        print("No data available for analysis")
-        return
-    
-    if metric_name == "consistency":
-        print(" Per-Explainer Statistics (mean ± std):")
-        print("-" * 50)
-        
-        for explainer in df.index:
-            values_str = df.loc[explainer].dropna()
-            if len(values_str) > 0:
-                means = []
-                stds = []
-                for val_str in values_str:
-                    if isinstance(val_str, str) and "±" in val_str:
-                        try:
-                            mean_part, std_part = val_str.split("±")
-                            means.append(float(mean_part))
-                            stds.append(float(std_part))
-                        except ValueError:
-                            continue
-                
-                if means:
-                    avg_mean = np.mean(means)
-                    avg_std = np.mean(stds)
-                    count = len(means)
-                    coverage = count / len(df.columns)
-                    
-                    min_mean = np.min(means)
-                    max_mean = np.max(means)
-                    
-                    print(f"  {explainer:>15s}: μ={avg_mean:.4f}±{avg_std:.4f} "
-                          f"range=[{min_mean:.4f},{max_mean:.4f}] (n={count}, {coverage:.1%})")
-        
-        return
-    
-    # Analisi per altri metrics
-    print(" Per-Explainer Statistics:")
-    print("-" * 40)
-    for explainer in df.index:
-        values = df.loc[explainer].dropna()
-        if len(values) > 0:
-            mean_val = values.mean()
-            std_val = values.std()
-            count = len(values)
-            coverage = len(values) / len(df.columns)
-            print(f"  {explainer:>15s}: μ={mean_val:.4f} σ={std_val:.4f} (n={count}, {coverage:.1%} coverage)")
-    
-    print("\n Per-Model Statistics:")
-    print("-" * 40)
-    for model in df.columns:
-        values = df[model].dropna()
-        if len(values) > 0:
-            mean_val = values.mean()
-            std_val = values.std()
-            count = len(values)
-            coverage = len(values) / len(df.index)
-            print(f"  {model:>15s}: μ={mean_val:.4f} σ={std_val:.4f} (n={count}, {coverage:.1%} coverage)")
+
+def _load_summary(path: Path) -> Optional[dict]:
+    from utils import load_json
+    return load_json(path)
+
 
 # =============================================================================
-# MAIN REPORT FUNCTION
+# Stima dei tempi
 # =============================================================================
+def estimate(models_: List[str], explainers_: List[str], metrics_to_compute: List[str], cfg,
+             n_texts: int, n_probe: int = 3) -> pd.DataFrame:
+    """Misura il tempo di una spiegazione su `n_probe` testi di lunghezza tipica e
+    lo moltiplica per il numero di spiegazioni del run completo."""
+    import explainers
+    import models
+    raw_texts, _ = dataset.get_clustered_sample(None)
+    lengths = np.array([len(t.split()) for t in raw_texts])
+    probe_idx = [int(np.argsort(np.abs(lengths - np.quantile(lengths, q)))[0])
+                 for q in np.linspace(0.25, 0.75, n_probe)]
+    calls = 0
+    if "robustness" in metrics_to_compute:
+        calls += 1 + 3 * metrics.N_PERTURBATIONS_PER_TYPE
+    elif "contrastivity" in metrics_to_compute:
+        calls += 1
+    if "consistency" in metrics_to_compute:
+        calls += len(metrics.CONSISTENCY_SEEDS)
+    rows = []
+    for mk in models_:
+        print(f"[ESTIMATE] {mk}: caricamento...")
+        model, tok = models.load_model(mk), models.load_tokenizer(mk)
+        texts = prepare_texts(tok, [raw_texts[i] for i in probe_idx], cfg.max_length)
+        for ex in explainers_:
+            explain = explainers.get_explainer(ex, model, tok, cfg)
+            set_seed(42)
+            explain(texts[0])  # riscaldamento
+            t0 = time.time()
+            for t in texts:
+                set_seed(42)
+                explain(t)
+            per_call = (time.time() - t0) / len(texts)
+            total = per_call * calls * n_texts
+            rows.append({"model": mk, "explainer": ex, "sec_per_explanation": per_call,
+                         "hours_full_run": total / 3600})
+            print(f"  {ex:18s} {per_call:7.3f} s/spiegazione  ->  {format_time(total)} per {n_texts} testi")
+        del model
+        models.clear_gpu_memory()
+    df = pd.DataFrame(rows)
+    print("\nOre stimate (modelli x explainer):")
+    print(df.pivot(index="explainer", columns="model", values="hours_full_run").to_string(float_format=lambda x: f"{x:.2f}"))
+    print(f"\nTotale stimato: {df['hours_full_run'].sum():.1f} ore "
+          f"({calls} spiegazioni per testo, {n_texts} testi; download dei modelli escluso)")
+    return df
 
-def run_complete_report(
-    models_to_test: List[str] = None,
-    explainers_to_test: List[str] = None, 
-    metrics_to_compute: List[str] = None,
-    sample_size: int = 100,
-    resume: bool = True
-) -> Dict[str, pd.DataFrame]:
-    """Esegue report completo XAI."""
-    
-    start_time = time.time()
-    
-    try:
-        print("="*80)
-        print(" XAI COMPLETE REPORT (SIMPLIFIED)")
-        print("="*80)
-        print(" 3 Metrics: Robustness, Consistency, Contrastivity")
-        print(" Consistency: CORRECT LOGIC - per-observation mean correlations")
-        print("="*80)
-        
-        # Setup defaults
-        available_models, available_explainers = get_available_resources()
-        
-        if models_to_test is None:
-            models_to_test = available_models
-        if explainers_to_test is None:
-            explainers_to_test = available_explainers
-        if metrics_to_compute is None:
-            metrics_to_compute = METRICS
-        
-        # Filter available
-        models_to_test = [m for m in models_to_test if m in available_models]
-        explainers_to_test = [e for e in explainers_to_test if e in available_explainers]
-        
-        total_combinations = len(models_to_test) * len(explainers_to_test) * len(metrics_to_compute)
-        
-        print(f"\n[REPORT] Configuration:")
-        print(f"  Models: {models_to_test}")
-        print(f"  Explainers: {explainers_to_test}")
-        print(f"  Metrics: {metrics_to_compute}")
-        print(f"  Sample size: {sample_size}")
-        print(f"  Total combinations: {total_combinations}")
-        
-        # Process each model
-        print(f"\n{'='*80}")
-        print("MODEL PROCESSING")
-        print(f"{'='*80}")
-        
-        all_results = {}
-        
-        for i, model_key in enumerate(models_to_test, 1):
-            print(f"\n[{i}/{len(models_to_test)}] Model: {model_key}")
-            
+
+# =============================================================================
+# Main
+# =============================================================================
+def library_versions() -> dict:
+    out = {"python": platform.python_version()}
+    for name in ("torch", "transformers", "lime", "numpy", "scipy", "sklearn", "pandas"):
+        try:
+            mod = __import__(name)
+            out[name] = getattr(mod, "__version__", "?")
+        except Exception:
+            out[name] = None
+    return out
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description="XAI benchmark (versione allineata alla tesi)")
+    p.add_argument("--models", nargs="+", default=None, help=f"default: {MODEL_ORDER}")
+    p.add_argument("--explainers", nargs="+", choices=EXPLAINERS, default=EXPLAINERS)
+    p.add_argument("--metrics", nargs="+", choices=METRICS, default=METRICS)
+    p.add_argument("--sample", type=int, default=400, help="testi (default 400, tutto il campione)")
+    p.add_argument("--max-length", type=int, default=512)
+    p.add_argument("--flow-max-length", type=int, default=128)
+    p.add_argument("--flow-workers", type=int, default=1)
+    p.add_argument("--lime-samples", type=int, default=500)
+    p.add_argument("--shap-samples", type=int, default=15)
+    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--no-amp", action="store_true", help="niente float16 nei forward di LIME/SHAP")
+    p.add_argument("--device", default=None, help="cuda o cpu (default: cuda se disponibile)")
+    p.add_argument("--out-dir", default="runs/v2")
+    p.add_argument("--no-resume", action="store_true", help="ricomincia da zero (cancella i .jsonl)")
+    p.add_argument("--local-model", nargs="*", default=[], metavar="KEY=PATH",
+                   help="modelli locali aggiuntivi (usati dai test)")
+    p.add_argument("--estimate", action="store_true", help="stima i tempi e termina")
+    args = p.parse_args(argv)
+
+    import explainers
+    import models
+    if args.device:
+        models.set_device(args.device)
+    for spec in args.local_model:
+        k, path = spec.split("=", 1)
+        models.register_model(k, path)
+    models_ = args.models or [m for m in MODEL_ORDER if m in models.MODELS]
+    unknown = [m for m in models_ if m not in models.MODELS]
+    if unknown:
+        p.error(f"modelli sconosciuti: {unknown}")
+
+    cfg = explainers.ExplainerConfig(max_length=args.max_length, flow_max_length=args.flow_max_length,
+                                     flow_workers=args.flow_workers, lime_samples=args.lime_samples,
+                                     shap_samples=args.shap_samples, batch_size=args.batch_size,
+                                     amp=not args.no_amp)
+    raw_texts, labels = dataset.get_clustered_sample(args.sample)
+    print(f"[DATA] {len(raw_texts)} testi ({sum(labels)} positivi), device {models.DEVICE}")
+
+    if args.estimate:
+        estimate(models_, args.explainers, args.metrics, cfg, n_texts=len(raw_texts))
+        return 0
+
+    out_root = Path(args.out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    meta = {"git_commit": git_commit(), "argv": sys.argv, "config": vars(cfg),
+            "metrics": args.metrics, "explainers": args.explainers, "models": {m: models.MODELS[m] for m in models_},
+            "n_texts": len(raw_texts), "n_positive": int(sum(labels)),
+            "dataset_sha256": hashlib.sha256("\n".join(raw_texts).encode()).hexdigest(),
+            "consistency_seeds": metrics.CONSISTENCY_SEEDS, "perturbation_ratio": metrics.PERTURBATION_RATIO,
+            "perturbations_per_type": metrics.N_PERTURBATIONS_PER_TYPE,
+            "contrastivity_vocab_size": metrics.CONTRASTIVITY_VOCAB_SIZE,
+            "device": str(models.DEVICE), "versions": library_versions(), "truncation": {}}
+
+    for mk in models_:
+        print(f"\n{'=' * 70}\n MODELLO {mk}\n{'=' * 70}")
+        with Timer(f"caricamento {mk}"):
+            model, tok = models.load_model(mk), models.load_tokenizer(mk)
+        texts = prepare_texts(tok, raw_texts, cfg.max_length)
+        n_cut = sum(len(t.split(" ")) < len(normalize_whitespace(r).split(" ")) for t, r in zip(texts, raw_texts))
+        meta["truncation"][mk] = {"texts_truncated_at_max_length": int(n_cut)}
+        print(f"[DATA] {n_cut}/{len(texts)} testi troncati a {cfg.max_length} token")
+        for ex in args.explainers:
+            print(f"\n[{mk}] {ex}")
             try:
-                with Timer(f"Processing {model_key}"):
-                    results = process_model_core(
-                        model_key=model_key,
-                        explainers_to_test=explainers_to_test,
-                        metrics_to_compute=metrics_to_compute,
-                        sample_size=sample_size
-                    )
-                    all_results[model_key] = {"results": results, "completed": True}
-                
-                print(f"[SUCCESS] {model_key} completed successfully")
-                
+                with Timer(f"{mk}/{ex}"):
+                    s = run_explainer(model, tok, ex, texts, labels, args.metrics, cfg,
+                                      out_root / mk / ex, resume=not args.no_resume)
+                print(f"  -> {_short(s)}")
             except Exception as e:
-                print(f"[ERROR] Model {model_key} failed: {e}")
-                all_results[model_key] = {
-                    "results": {metric: {} for metric in metrics_to_compute},
-                    "completed": False,
-                    "error": str(e)
-                }
-        
-        # Build tables
-        print(f"\n{'='*80}")
-        print("BUILDING TABLES")
-        print(f"{'='*80}")
-        
-        tables = build_report_tables(all_results, metrics_to_compute)
-        
-        # Analysis & Output
-        print(f"\n{'='*80}")
-        print("ANALYSIS & OUTPUT")
-        print(f"{'='*80}")
-        
-        execution_time = time.time() - start_time
-        
-        # Print tables with analysis
-        for metric_name, df in tables.items():
-            if not df.empty:
-                print(f"\n {metric_name.upper()} TABLE:")
-                print("=" * 50)
-                
-                if metric_name == "consistency":
-                    print(df.to_string(na_rep="—"))
-                else:
-                    print(df.to_string(float_format="%.4f", na_rep="—"))
-                
-                # Save CSV
-                csv_file = RESULTS_DIR / f"{metric_name}_table_complete.csv"
-                df.to_csv(csv_file)
-                print(f"[SAVE] CSV saved: {csv_file}")
-                
-                # Analysis
-                print_table_analysis(df, metric_name)
-        
-        # Final summary
-        print(f"\n{'='*80}")
-        print(" COMPLETE REPORT FINISHED!")
-        print(f"{'='*80}")
-        print(f"  Total time: {execution_time/60:.1f} minutes")
-        print(f"  Models processed: {len([r for r in all_results.values() if r.get('completed', False)])}/{len(models_to_test)}")
-        print(f"  Tables generated: {len([t for t in tables.values() if not t.empty])}")
-        print(f"  Files saved in: {RESULTS_DIR}")
-        
-        return tables
-        
-    except Exception as e:
-        print(f"\nCOMPLETE REPORT FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        return {}
+                print(f"  [ERRORE] {mk}/{ex}: {type(e).__name__}: {e}")
+                save_json(out_root / mk / ex / "failed.json", {"error": f"{type(e).__name__}: {e}"})
+        del model
+        models.clear_gpu_memory()
+        save_json(out_root / "run_metadata.json", meta)
 
-def get_available_resources():
-    """Ottieni risorse disponibili."""
-    available_models = list(models.MODELS.keys())
-    available_explainers = [exp for exp in EXPLAINERS if exp in explainers.list_explainers()]
-    
-    print(f"[RESOURCES] Models: {len(available_models)} available")
-    print(f"[RESOURCES] Explainers: {len(available_explainers)} available")
-    print(f"[RESOURCES] Metrics: {len(METRICS)} available")
-    print(f"[RESOURCES] Dataset: {len(dataset.test_df)} clustered examples")
-    
-    return available_models, available_explainers
+    tables = build_tables(out_root, models_, args.explainers)
+    for m, df in tables.items():
+        if not df.empty:
+            print(f"\n{m.upper()}\n{df.to_string(float_format=lambda x: f'{x:.4f}')}")
+    save_json(out_root / "run_metadata.json", meta)
+    return 0
 
-# =============================================================================
-# CLI INTERFACE
-# =============================================================================
 
-def main():
-    """Main CLI entry point."""
-    parser = argparse.ArgumentParser(description="XAI Complete Report Generator")
-    parser.add_argument("--sample", type=int, default=100, help="Sample size (default: 100)")
-    parser.add_argument("--models", nargs="+", choices=list(models.MODELS.keys()), 
-                       default=None, help="Models to test")
-    parser.add_argument("--explainers", nargs="+", choices=EXPLAINERS,
-                       default=None, help="Explainers to test")
-    parser.add_argument("--metrics", nargs="+", choices=METRICS,
-                       default=None, help="Metrics to compute")
-    parser.add_argument("--no-resume", dest="resume", action="store_false", 
-                       default=True, help="Start fresh (no resume)")
-    parser.add_argument("--no-backup", dest="backup_to_drive", action="store_false",
-                       default=True, help="Skip Google Drive backup")
-    
-    args = parser.parse_args()
-    
-    print("XAI COMPLETE REPORT - SIMPLIFIED VERSION")
-    print("="*50)
-    print("3 Core Metrics: Robustness, Consistency, Contrastivity")
-    print("Consistency: CORRECT LOGIC implementation")
-    if args.backup_to_drive:
-        print("Google Drive backup: ENABLED")
-    else:
-        print("Google Drive backup: DISABLED")
-    print("="*50)
-    
-    tables = run_complete_report(
-        models_to_test=args.models,
-        explainers_to_test=args.explainers,
-        metrics_to_compute=args.metrics,
-        sample_size=args.sample,
-        resume=args.resume,
-        backup_to_drive=args.backup_to_drive
-    )
-    
-    if not any(not df.empty for df in tables.values()):
-        print("No results generated!")
-        sys.exit(1)
-    else:
-        print("Complete report generated successfully!")
+def _short(s: dict) -> str:
+    parts = []
+    if s.get("robustness"):
+        r = s["robustness"]
+        parts.append(f"robustness {r['mean']:.4f} (n={r['n_valid']})" if r["mean"] is not None else "robustness n/d")
+    if s.get("consistency"):
+        c = s["consistency"]
+        parts.append(f"consistency {c['mean']:.4f}±{(c['std'] or 0):.4f} (n={c['n_valid']})" if c["mean"] is not None else "consistency n/d")
+    if s.get("contrastivity"):
+        v = s["contrastivity"]["contrastivity"]
+        parts.append(f"contrastivity {v:.4f}" if v is not None else "contrastivity n/d")
+    return ", ".join(parts)
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

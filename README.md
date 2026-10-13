@@ -1,127 +1,170 @@
 # XAI Benchmark for Sentiment Analysis
 
-> Bachelor's thesis project — Università degli Studi di Milano-Bicocca  
-> BSc in Statistics and Information Management
+Code for my bachelor's thesis *Valutazione di metodi XAI applicati a modelli linguistici basati su encoder per l'analisi del sentiment* (Università degli Studi di Milano-Bicocca, BSc in Statistics and Information Management, A.Y. 2024/2025). Supervisor: Prof. Navid Nobani. Co-supervisor: Dr. Antonio Serino. The thesis is in [`triennale_895103.pdf`](triennale_895103.pdf).
 
----
+The benchmark compares six post-hoc explanation methods on five fine-tuned encoder-only Transformers, using three metrics: robustness, consistency and contrastivity.
 
-## Overview
+## Two versions of the code
 
-This repository contains the code developed for my bachelor's thesis, which proposes a **systematic benchmark for evaluating post-hoc explainability methods** applied to encoder-only Transformer architectures in the context of **sentiment analysis**.
+| | `thesis-v1` (tag) | `v2` (this branch) |
+|---|---|---|
+| Commit | `fc73a9e`, 22 Aug 2025 | current |
+| Produced the thesis tables | yes (run of 22 Aug 2025, saved in [`results_thesis_v1/`](results_thesis_v1)) | no, results pending |
+| Matches the methods described in the thesis | partly, see [Known issues in v1](#known-issues-in-v1) | yes, with the choices listed in [Choices not fixed by the thesis](#choices-not-fixed-by-the-thesis) |
 
-The benchmark assesses six XAI methods across three quantitative metrics — robustness, consistency, and contrastivity — providing a structured comparison of their reliability and discriminative power on pre-trained language models.
+The numbers in the thesis come from `thesis-v1`. A later clean-up (September 2025) removed unused code and broke `report.py`, but did not change the explainers or the logic of the metrics. `v2` rewrites them to follow the definitions in chapters 2 and 3 of the thesis. Because the implementations change, the `v2` numbers are expected to differ from the thesis tables.
 
----
+## Methods
 
-## XAI Methods Evaluated
+| Method | Family | Thesis | v2 implementation |
+|---|---|---|---|
+| LIME | perturbation | pp. 31-33 | `lime` library, one feature per word position, removed words replaced by the mask token |
+| KernelSHAP | perturbation | pp. 33-34, eq. 2.7-2.10 | own implementation of eq. 2.9-2.10 (`attribution.kernel_shap_values`), 15 sampled coalitions, mask-token baseline |
+| Input×Gradient | gradient | p. 35, eq. 2.11 | gradient of the positive-class logit times word embeddings |
+| LRP | relevance propagation | pp. 36-38, eq. 2.18-2.19 | Ali et al. (2022) AH-rule and LN-rule: attention weights and the LayerNorm scale treated as constants, then Gradient×Input on the modified graph |
+| Attention Rollout | attention | pp. 38-39, eq. 2.20-2.24 | `A = ½W + ½I`, product over layers, `[CLS]` row |
+| Attention Flow | attention | pp. 39-40 | exact max-flow (Dinic) from `[CLS]` in the last layer to every input token |
 
-| Method | Category |
-|--------|----------|
-| LIME | Perturbation-based |
-| SHAP | Perturbation-based |
-| Input × Gradient  | Gradient-based |
-| Layer-wise Relevance Propagation (LRP) | Gradient-based |
-| Attention Rollout | Attention-based |
-| Attention Flow | Attention-based |
+All explanations are reported per word (scores of sub-word tokens are summed), so the six methods are compared on the same unit.
 
----
+## Metrics
 
-## Evaluation Metrics
+- **Robustness** (eq. 3.1-3.3): mean absolute difference of [0, 1]-normalised scores on the words shared by the explanation of a text and of a perturbed copy (random masking, deletion, synonym substitution, ρ = 0.15, two perturbations each). Lower is more stable.
+- **Consistency** (eq. 3.4-3.6): dropout switched on at inference, four seeds (42, 123, 456, 789), mean Spearman correlation over the six seed pairs, then mean ± standard deviation over texts.
+- **Contrastivity** (p. 50): KL divergence, base 2, between the per-word score distributions of positive and negative texts, over the 1,000 most frequent words.
 
-### Robustness
-Measures explanation stability under local text perturbations (token masking, deletion, substitution). Lower divergence indicates higher robustness.
+Robustness and consistency measure stability, not faithfulness: a method that always returned the same explanation would score perfectly on both.
 
-### Consistency
-Measures explanation stability across inference seeds. For each observation, pairwise correlations between explanations generated under different seeds are computed; the final score is the mean correlation across the dataset.
+## Models and data
 
-### Contrastivity
-Measures the capacity of an explainer to produce distinguishable attributions for positive vs. negative sentiment instances, via KL divergence over token-level attribution distributions.
+| Key | Hugging Face model | Layers |
+|---|---|---|
+| `tinybert` | [Harsha901/tinybert-imdb-sentiment-analysis-model](https://huggingface.co/Harsha901/tinybert-imdb-sentiment-analysis-model) | 4 |
+| `distilbert` | [distilbert/distilbert-base-uncased-finetuned-sst-2-english](https://huggingface.co/distilbert/distilbert-base-uncased-finetuned-sst-2-english) | 6 |
+| `roberta-base` | [AnkitAI/reviews-roberta-base-sentiment-analysis](https://huggingface.co/AnkitAI/reviews-roberta-base-sentiment-analysis) | 12 |
+| `bert-large` | [assemblyai/bert-large-uncased-sst2](https://huggingface.co/assemblyai/bert-large-uncased-sst2) | 24 |
+| `roberta-large` | [siebert/sentiment-roberta-large-english](https://huggingface.co/siebert/sentiment-roberta-large-english) | 24 |
 
----
+The models were fine-tuned by their authors on different data (SST-2, IMDB, other review corpora), so model size and training data are confounded.
 
-## Models
+Data: 400 reviews drawn from the 5,000 reviews in `Test.csv` (IMDB) with TF-IDF + k-means and stratified sampling (thesis, p. 50): 188 positive, 212 negative. The sample is frozen in [`data/imdb_clustered_400.csv`](data/imdb_clustered_400.csv), because k-means results depend on the scikit-learn version. Rebuilding it with `python dataset.py --rebuild` gives the same class counts as in the thesis. `Train.csv` is not used.
 
-Five pre-trained Transformer models sourced from HuggingFace:
+## Running
 
-| Key | HuggingFace Model |
-|-----|-------------------|
-| `tinybert` | [Harsha901/tinybert-imdb-sentiment-analysis-model](https://huggingface.co/Harsha901/tinybert-imdb-sentiment-analysis-model) |
-| `distilbert` | [distilbert/distilbert-base-uncased-finetuned-sst-2-english](https://huggingface.co/distilbert/distilbert-base-uncased-finetuned-sst-2-english) |
-| `roberta-base` | [AnkitAI/reviews-roberta-base-sentiment-analysis](https://huggingface.co/AnkitAI/reviews-roberta-base-sentiment-analysis) |
-| `roberta-large` | [siebert/sentiment-roberta-large-english](https://huggingface.co/siebert/sentiment-roberta-large-english) |
-| `bert-large` | [assemblyai/bert-large-uncased-sst2](https://huggingface.co/assemblyai/bert-large-uncased-sst2) |
-
----
-
-## Dataset
-
-The benchmark uses the [IMDB Dataset for Sentiment Analysis](https://www.kaggle.com/datasets/columbine/imdb-dataset-sentiment-analysis-in-csv-format) (CSV format) sourced from Kaggle, containing movie reviews labeled as positive or negative. Sampling is performed via K-Means clustering to ensure lexical diversity and class balance across the selected observations (default: 400 samples).
-
----
-
-## Project Structure
-
-```
-XAI-benchmark-Thesis/
-├── models.py           # Model loading and GPU management
-├── dataset.py          # Clustering-based stratified sampling
-├── explainers.py       # XAI method implementations
-├── metrics.py          # Robustness, consistency, contrastivity
-├── report.py           # Main benchmark runner
-├── utils.py            # Memory management utilities
-├── Train.csv           # Training split
-├── Test.csv            # Test split
-└── requirements.txt    # Dependencies
-```
-
----
-
-## Usage
-
-### Installation
+Requirements: Python 3.10+, PyTorch, Transformers 4.46 or later (the code needs `attn_implementation="eager"` and fast tokenizers), `lime`, NumPy, SciPy, scikit-learn, pandas. See [`requirements.txt`](requirements.txt).
 
 ```bash
 pip install -r requirements.txt
+
+# 1. tests (CPU, a few minutes, no download): tiny random BERT/RoBERTa/DistilBERT
+python -m pytest -q tests
+
+# 2. time estimate on the current hardware, before paying for a long run
+python report.py --estimate
+
+# 3. full benchmark (400 texts, 5 models, 6 methods, 3 metrics)
+python report.py --out-dir runs/v2
 ```
 
-> Designed for **Google Colab** with GPU support (12–16 GB VRAM recommended).
+The run can be interrupted and restarted with the same command: each finished text is written immediately and skipped on restart.
 
-### Run the Benchmark
+On Google Colab, [`colab_run.ipynb`](colab_run.ipynb) contains these steps. A sensible order is: tests on a free CPU runtime, `--estimate` on a GPU runtime, then the full run with `--out-dir` on Google Drive so that results survive a disconnection. Attention Flow runs on the CPU even when a GPU is available (the max-flow step is the expensive part), so it can be run separately on a CPU runtime:
 
 ```bash
-# Full benchmark with default settings (400 samples, all models and explainers)
-python report.py --sample 400
-
-# Custom model and explainer selection
-python report.py --sample 400 --models tinybert distilbert --explainers lime shap grad_input
-
-# Specific metrics only
-python report.py --sample 200 --metrics robustness consistency
+python report.py --explainers lime shap grad_input attention_rollout lrp --out-dir /content/drive/MyDrive/xai_v2
+python report.py --explainers attention_flow --device cpu --flow-workers 2 --out-dir /content/drive/MyDrive/xai_v2
 ```
 
-Results are saved as CSV tables in the `xai_results/` directory.
+Main options: `--models`, `--explainers`, `--metrics`, `--sample` (default 400), `--max-length` (512), `--flow-max-length` (128), `--lime-samples` (500), `--shap-samples` (15), `--batch-size`, `--device`, `--no-resume`.
 
----
+Outputs in `--out-dir`: `<model>/<method>/eval.jsonl` and `train.jsonl` (per-text values), `summary.json` (aggregates and counts of invalid values), `robustness_table.csv`, `consistency_table.csv`, `contrastivity_table.csv`, `run_metadata.json` (configuration, library versions, git commit).
 
-## Dependencies
+## Choices not fixed by the thesis
+
+- **Unit of explanation**: words separated by spaces; sub-word scores are summed.
+- **Explained class**: always the positive class (positive logit for gradient methods, positive probability for LIME and SHAP).
+- **Truncation**: 512 tokens for all methods except Attention Flow, which uses the first 128 tokens. Exact max-flow costs roughly L·n³: on one CPU core it takes about 3 s per explanation for a 24-layer model at 128 tokens and an estimated 4 minutes at 512, which would make the full run impractical. 46 of the 400 reviews have more than 380 words, about the 512-token limit, so for those the other methods also see only the beginning.
+- **LIME samples**: 500 (the thesis does not state a number; the library default is 5,000).
+- **Robustness**: two perturbations per strategy; a perturbation that cannot be applied (for example no word in the synonym dictionary) is recorded and excluded, not scored. The synonym dictionary has 130 entries.
+- **Contrastivity**: scores are divided by the maximum absolute score of each explanation before summing. This keeps the sign, which the "S − min S" step needs, and gives each text the same weight. With [0, 1] scores, every word absent from one class would get probability zero and the divergence would be dominated by ε. The comparison uses the true labels of the texts.
+- **Invalid values** (for example Spearman on a constant explanation): `NaN`, excluded from the means and counted in `summary.json`.
+- **Precision**: weights in float32; float16 autocast only for the gradient-free forward passes of LIME and SHAP on GPU.
+
+## Known issues in v1
+
+Found when comparing `thesis-v1` with the thesis text. They affect the tables in the thesis.
+
+- `report.py` (after the September clean-up) fails at start-up: `main()` passes `backup_to_drive` to a function without that parameter.
+- Robustness and consistency used at most 40 texts, contrastivity 40 per class (fewer with less free RAM), not 400.
+- LIME used 50 samples and only the 15 most important words; these settings are not stated in the thesis.
+- LRP was a single backward pass with `e·g/(|e|+ε)`, without the AH and LN rules: in practice Input×Gradient, which is why the two methods have almost identical numbers.
+- Attention Flow computed the max-flow for the first 5 positions only, on edges above 0.1, so most tokens got zero.
+- SHAP: the KernelSHAP code with 15 samples was after a `return` and never ran; `shap.Explainer` with a text masker ran instead, truncated at 128 tokens.
+- Contrastivity kept the first 1,000 tokens in alphabetical order, not the most frequent.
+- Consistency switched dropout on, but four explainers called `model.eval()` at each explanation, so for them dropout was off; only LIME and SHAP were evaluated with dropout.
+- Consistency matched tokens by string, keeping only the last occurrence of repeated tokens: two identical explanations of a text with repeated words did not get a correlation of 1.
+- Robustness: the synonym dictionary had 12 entries and in most texts the substitution changed nothing; any error returned 0.0, the best possible score. Several fallbacks returned fixed values (0.05, 0.1) instead of missing values.
+- Scores were normalised to [−1, 1] for four methods and left raw for LIME and SHAP, so the metrics compared different scales.
+- Text, p. 52: SHAP on RoBERTa-large is reported as 0.0012, the table says 0.0117.
+
+## Results reported in the thesis (v1)
+
+Produced by `thesis-v1` on 22 August 2025 (Colab). See the issues above before reading them.
+
+Robustness (lower is more stable)
+
+| Method | tinybert | distilbert | roberta-base | bert-large | roberta-large |
+|---|---|---|---|---|---|
+| LIME | 0.0461 | 0.0774 | 0.0581 | 0.0594 | 0.0621 |
+| SHAP | 0.0049 | 0.0098 | 0.0082 | 0.0096 | 0.0117 |
+| Input×Gradient | 0.2985 | 0.2809 | 0.3048 | 0.3552 | 0.4592 |
+| Attention Rollout | 0.0117 | 0.0061 | 0.0034 | 0.0100 | 0.0048 |
+| Attention Flow | 0.0957 | 0.0964 | 0.0750 | 0.0972 | 0.0751 |
+| LRP | 0.2852 | 0.2906 | 0.3173 | 0.3639 | 0.4967 |
+
+Consistency (mean ± sd)
+
+| Method | tinybert | distilbert | roberta-base | bert-large | roberta-large |
+|---|---|---|---|---|---|
+| LIME | 0.2448 ± 0.3139 | 0.1781 ± 0.3058 | 0.0853 ± 0.3114 | 0.2992 ± 0.3348 | 0.0616 ± 0.3434 |
+| SHAP | 0.4012 ± 0.1244 | 0.4543 ± 0.1425 | 0.3912 ± 0.1239 | 0.3423 ± 0.1548 | 0.2671 ± 0.1295 |
+| Input×Gradient | 0.7602 ± 0.0712 | 0.6109 ± 0.1006 | 0.6977 ± 0.0903 | 0.6628 ± 0.1093 | 0.6652 ± 0.0956 |
+| Attention Rollout | 0.8575 ± 0.0618 | 0.8536 ± 0.0623 | 0.8358 ± 0.0703 | 0.9550 ± 0.0285 | 0.8953 ± 0.0527 |
+| Attention Flow | 0.7580 ± 0.1290 | 0.7540 ± 0.1284 | 0.7900 ± 0.1226 | 0.7538 ± 0.1246 | 0.7843 ± 0.1268 |
+| LRP | 0.7833 ± 0.0566 | 0.6164 ± 0.1003 | 0.7047 ± 0.0855 | 0.6438 ± 0.1139 | 0.6657 ± 0.0955 |
+
+Contrastivity (KL divergence, higher is more contrastive)
+
+| Method | tinybert | distilbert | roberta-base | bert-large | roberta-large |
+|---|---|---|---|---|---|
+| LIME | 0.0434 | 0.0492 | 0.0886 | 0.0428 | 0.0414 |
+| SHAP | 0.1636 | 0.0561 | 0.0641 | 0.0779 | 0.0400 |
+| Input×Gradient | 0.8019 | 0.1464 | 0.0890 | 0.0123 | 0.4540 |
+| Attention Rollout | 0.0002 | 0.0002 | 0.0040 | 0.0002 | 0.0038 |
+| Attention Flow | 0.0002 | 0.0002 | 0.0014 | 0.0002 | 0.0014 |
+| LRP | 0.7214 | 0.1170 | 0.0857 | 0.0032 | 0.2334 |
+
+## Limitations (thesis, p. 61)
+
+- 400 English reviews from IMDB only.
+- The perturbations used for robustness do not cover all meaning-preserving transformations.
+- Consistency is estimated within one model (dropout at inference) rather than across models fine-tuned with different seeds.
+- Contrastivity is restricted to the 1,000 most frequent words, which lowers sensitivity to rare words.
+
+## Repository structure
 
 ```
-torch>=2.2.0
-transformers>=4.41.0
-pandas>=2.2.2
-scikit-learn>=1.5.0
-lime>=0.2.0
-shap>=0.45.0
-networkx>=3.0
+├── attribution.py      # word-level explanations, Rollout, Flow, KernelSHAP, LIME helper (no PyTorch)
+├── explainers.py       # the six methods on Hugging Face models
+├── metrics.py          # perturbations, robustness, consistency, contrastivity (no PyTorch)
+├── models.py           # model registry and loading
+├── dataset.py          # 400-review sample (k-means + stratified sampling)
+├── report.py           # benchmark runner, time estimate, tables
+├── utils.py            # seeds, timing, result files
+├── tests/              # test_core.py (NumPy only), test_torch.py (tiny random models)
+├── colab_run.ipynb     # tests, time estimate and full run on Colab
+├── data/imdb_clustered_400.csv
+├── results_thesis_v1/  # tables and per-model results of the thesis run
+├── Test.csv, Train.csv
+└── triennale_895103.pdf
 ```
-
-See `requirements.txt` for the full list.
-
----
-
-## Author
-
-**Nicolò Bachiorri**  
-BSc in Statistics and Information Management  
-Università degli Studi di Milano-Bicocca
-

@@ -1,48 +1,40 @@
 """
-dataset_optimized.py - Clustering ottimizzato per ottenere esattamente 400 osservazioni
-=====================================================================================
+dataset.py – Campione di 400 recensioni IMDB usato nella tesi (cap. 3.2)
+=======================================================================
 
-STRATEGIA OTTIMIZZATA:
-1. Analisi automatica del numero ottimale di cluster
-2. Clustering adattivo con verifica dei risultati
-3. Post-processing per garantire esattamente 400 osservazioni
-4. Bilanciamento automatico delle classi
+Procedura (tesi, p. 50): dal test set di 5.000 recensioni (`Test.csv`) si
+vettorializza con TF-IDF (vocabolario di 8.000 termini), si applica k-means e si
+campiona in modo stratificato dentro i cluster, fino a 400 osservazioni.
 
+L'algoritmo di clustering e campionamento è quello della versione della tesi
+(commit `fc73a9e`), invariato. La differenza è che il campione viene salvato una
+volta per tutte in `data/imdb_clustered_400.csv`: k-means dipende dalla versione
+di scikit-learn, quindi ricostruirlo a ogni esecuzione non garantisce gli stessi
+400 testi. Se il CSV esiste viene letto; altrimenti viene ricostruito e salvato.
 """
 
-import pandas as pd
-import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
-from pathlib import Path
 import pickle
-from typing import Tuple, List, Optional, Dict
-from transformers import AutoTokenizer
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler
-from collections import Counter
-import warnings
-warnings.filterwarnings('ignore')
 
-# ==== Parametri Configurabili ====
-DATA_DIR = Path(".")
-TEST_FILE = "Test.csv"
-CACHE_DIR = Path("dataset_cache")
-CACHE_DIR.mkdir(exist_ok=True)
+# ==== Parametri ====
+DATA_DIR = Path(__file__).resolve().parent
+TEST_FILE = DATA_DIR / "Test.csv"
+FROZEN_FILE = DATA_DIR / "data" / "imdb_clustered_400.csv"
 
-# Parametri target
 TARGET_DATASET_SIZE = 400
-MAX_LENGTH = 512
-BATCH_SIZE = 16
 RANDOM_STATE = 42
 
-# Parametri clustering ottimizzati
-MIN_CLUSTER_SIZE = 3  # Minimo per avere diversità
-MAX_CLUSTERS = 50     # Limite superiore ragionevole
-MIN_CLUSTERS = 20     # Limite inferiore per diversità
-
-print(f"[OPTIMIZER] Target: {TARGET_DATASET_SIZE} observations from clustered sampling")
+# Parametri clustering (invariati rispetto alla tesi)
+MIN_CLUSTER_SIZE = 3
+MAX_CLUSTERS = 50
+MIN_CLUSTERS = 20
 
 class OptimizedClusteringSampler:
     """Sampler intelligente che trova automaticamente il K ottimale."""
@@ -352,223 +344,70 @@ def intelligent_cluster_sampling(df: pd.DataFrame, cluster_labels: np.ndarray,
     
     return final_df
 
-def create_optimized_dataset(df: pd.DataFrame, cache_file: Path) -> pd.DataFrame:
-    """Pipeline completa ottimizzata."""
-    print(f"[PIPELINE] Creating optimized dataset from {len(df)} examples...")
-    
-    # Set seed
+def build_clustered_dataset(test_file: Path = TEST_FILE) -> Tuple[pd.DataFrame, dict]:
+    """Ricostruisce il campione da Test.csv (pipeline della tesi)."""
+    df = pd.read_csv(test_file)
+    df = df.dropna(subset=["text"]).copy()
+    df = df[df["text"].str.strip() != ""]
+    df["label"] = df["label"].apply(
+        lambda x: int(x) if str(x) in ["0", "1"] else (0 if str(x).lower() in ["negative", "neg"] else 1)
+    )
+    df = df.reset_index(drop=True)
+
     np.random.seed(RANDOM_STATE)
-    
-    # Step 1: Trova K ottimale
     sampler = OptimizedClusteringSampler(TARGET_DATASET_SIZE)
     k_optimal, samples_per_cluster = sampler.find_optimal_k(df)
-    
-    # Step 2: Embeddings
-    texts = df['text'].tolist()
-    embeddings, vectorizer = create_optimized_embeddings(texts)
-    
-    # Step 3: Clustering
-    cluster_labels, kmeans_model = perform_optimized_clustering(embeddings, k_optimal)
-    
-    # Step 4: Sampling intelligente
+    embeddings, _ = create_optimized_embeddings(df["text"].tolist())
+    cluster_labels, _ = perform_optimized_clustering(embeddings, k_optimal)
     final_df = intelligent_cluster_sampling(df, cluster_labels, k_optimal, samples_per_cluster)
-    
-    # Step 5: Cache
-    cache_data = {
-        'dataframe': final_df,
-        'cluster_labels': cluster_labels,
-        'kmeans_model': kmeans_model,
-        'vectorizer': vectorizer,
-        'metadata': {
-            'original_size': len(df),
-            'final_size': len(final_df),
-            'k_optimal': k_optimal,
-            'samples_per_cluster': samples_per_cluster,
-            'target_size': TARGET_DATASET_SIZE,
-            'version': '3.0_optimized'
-        }
-    }
-    
-    with open(cache_file, 'wb') as f:
-        pickle.dump(cache_data, f)
-    
-    print(f"[CACHE] Saved to {cache_file}")
-    
-    return final_df
+    meta = {"k_optimal": int(k_optimal), "samples_per_cluster": int(samples_per_cluster),
+            "original_size": int(len(df)), "final_size": int(len(final_df))}
+    return final_df, meta
 
-def load_optimized_dataset(cache_file: Path) -> Optional[pd.DataFrame]:
-    """Carica dataset ottimizzato da cache."""
-    if not cache_file.exists():
-        return None
-    
-    try:
-        with open(cache_file, 'rb') as f:
-            cache_data = pickle.load(f)
-        
-        df = cache_data['dataframe']
-        metadata = cache_data['metadata']
-        
-        print(f"[CACHE] Loaded {len(df)} samples (target: {metadata['target_size']})")
-        print(f"[CACHE] Config: K={metadata['k_optimal']}, samples={metadata['samples_per_cluster']}")
-        
-        return df
-    except Exception as e:
-        print(f"[CACHE] Cache loading failed: {e}")
-        return None
 
-# ==== Caricamento Automatico Dataset per Integrazione ====
-def initialize_dataset():
-    """Inizializza dataset ottimizzato automaticamente."""
-    cache_file = CACHE_DIR / f"optimized_dataset_{TARGET_DATASET_SIZE}.pkl"
-    
-    # Prova cache
-    final_df = load_optimized_dataset(cache_file)
-    
-    if final_df is None:
-        print("[PROCESS] Creating new optimized dataset...")
-        try:
-            df_original = pd.read_csv(DATA_DIR / TEST_FILE)
-            df_clean = df_original.dropna(subset=['text']).copy()
-            df_clean = df_clean[df_clean['text'].str.strip() != '']
-            df_clean['label'] = df_clean['label'].apply(lambda x: int(x) if str(x) in ['0', '1'] else (0 if str(x).lower() in ['negative', 'neg'] else 1))
-            df_clean = df_clean.reset_index(drop=True)
-            
-            final_df = create_optimized_dataset(df_clean, cache_file)
-        except FileNotFoundError as e:
-            print(f"[ERROR] File not found: {e}")
-            raise
-    
-    return final_df
+_CACHE: Optional[pd.DataFrame] = None
 
-# Inizializza dataset automaticamente all'import
-test_df = initialize_dataset()
 
-# ==== Compatibility Functions ====
+def get_dataset(rebuild: bool = False) -> pd.DataFrame:
+    """Restituisce il campione di 400 recensioni (colonne: text, label)."""
+    global _CACHE
+    if _CACHE is not None and not rebuild:
+        return _CACHE
+    if FROZEN_FILE.exists() and not rebuild:
+        df = pd.read_csv(FROZEN_FILE)
+    else:
+        df, meta = build_clustered_dataset()
+        FROZEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        df[["text", "label"]].to_csv(FROZEN_FILE, index=False)
+        print(f"[DATASET] Saved {len(df)} rows to {FROZEN_FILE} ({meta})")
+    _CACHE = df[["text", "label"]].reset_index(drop=True)
+    return _CACHE
+
+
 def get_clustered_sample(sample_size: Optional[int] = None, stratified: bool = True) -> Tuple[List[str], List[int]]:
-    """Restituisce sample del dataset clusterizzato (compatibilità)."""
-    if sample_size is None or sample_size >= len(test_df):
-        texts = test_df["text"].tolist()
-        labels = test_df["label"].tolist()
+    """Restituisce testi ed etichette. Con sample_size None o >= 400 restituisce tutto il campione."""
+    df = get_dataset()
+    if sample_size is None or sample_size >= len(df):
+        sample_df = df
+    elif stratified:
+        pos_df = df[df["label"] == 1]
+        neg_df = df[df["label"] == 0]
+        n_pos = min(sample_size // 2, len(pos_df))
+        n_neg = min(sample_size - n_pos, len(neg_df))
+        sample_df = pd.concat([
+            pos_df.sample(n_pos, random_state=RANDOM_STATE),
+            neg_df.sample(n_neg, random_state=RANDOM_STATE),
+        ]).sample(frac=1, random_state=RANDOM_STATE)
     else:
-        if stratified:
-            # Sampling stratificato
-            pos_df = test_df[test_df["label"] == 1]
-            neg_df = test_df[test_df["label"] == 0]
-            
-            n_pos = min(sample_size // 2, len(pos_df))
-            n_neg = min(sample_size - n_pos, len(neg_df))
-            
-            pos_sample = pos_df.sample(n_pos, random_state=RANDOM_STATE)
-            neg_sample = neg_df.sample(n_neg, random_state=RANDOM_STATE)
-            
-            sample_df = pd.concat([pos_sample, neg_sample]).sample(frac=1, random_state=RANDOM_STATE)
-        else:
-            sample_df = test_df.sample(sample_size, random_state=RANDOM_STATE)
-        
-        texts = sample_df["text"].tolist()
-        labels = sample_df["label"].tolist()
-    
-    return texts, labels
+        sample_df = df.sample(sample_size, random_state=RANDOM_STATE)
+    return sample_df["text"].tolist(), [int(x) for x in sample_df["label"].tolist()]
 
-def print_dataset_info():
-    """Stampa info dataset ottimizzato (compatibilità)."""
-    print(f"\n{'='*60}")
-    print("OPTIMIZED DATASET INFO")
-    print(f"{'='*60}")
-    print(f"Dataset size: {len(test_df)} (optimized from clustering)")
-    print(f"Target achieved: {len(test_df) == TARGET_DATASET_SIZE}")
-    
-    pos = (test_df["label"] == 1).sum()
-    neg = len(test_df) - pos
-    print(f"Distribution: {pos} pos ({pos/len(test_df):.1%}), {neg} neg ({neg/len(test_df):.1%})")
-    print(f"Clustering strategy: Adaptive K-means with intelligent sampling")
 
-# ==== Dataset Class ====
-class IMDBDataset(Dataset):
-    def __init__(self, dataframe, tokenizer=None, max_length=MAX_LENGTH):
-        """Dataset IMDB ottimizzato."""
-        self.dataframe = dataframe.reset_index(drop=True)
-        self.max_length = max_length
-        
-        # Tokenizer
-        if tokenizer is None:
-            self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-        else:
-            self.tokenizer = tokenizer
-            
-        # Pre-tokenizza
-        encodings = self.tokenizer(
-            list(self.dataframe["text"]),
-            truncation=True,
-            padding="max_length",
-            max_length=max_length,
-            return_tensors="pt"
-        )
-        
-        self.input_ids = encodings["input_ids"]
-        self.attention_masks = encodings["attention_mask"]
-        self.labels = torch.tensor(self.dataframe["label"].values, dtype=torch.long)
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        return {
-            "input_ids": self.input_ids[idx],
-            "attention_mask": self.attention_masks[idx],
-            "labels": self.labels[idx],
-        }
-
-# ==== DataLoader Factory ====
-def create_dataloaders(model_name=None, batch_size=BATCH_SIZE, max_length=MAX_LENGTH):
-    """Crea DataLoader per dataset ottimizzato (compatibilità)."""
-    if model_name:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-    
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token or "[PAD]"
-    
-    dataset = IMDBDataset(test_df, tokenizer, max_length)
-    
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=batch_size, 
-        shuffle=False,
-        num_workers=0
-    )
-    
-    return dataloader
-
-# Default DataLoader per compatibilità
-default_tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-if default_tokenizer.pad_token is None:
-    default_tokenizer.pad_token = "[PAD]"
-
-test_loader = DataLoader(
-    IMDBDataset(test_df, default_tokenizer), 
-    batch_size=BATCH_SIZE, 
-    shuffle=False,
-    num_workers=0
-)
-
-print(f"[DATASET] Ready: {len(test_df)} optimized examples, DataLoader created")
-
-# ==== Main Execution (per test standalone) ====
 if __name__ == "__main__":
-    print("\n" + "="*70)
-    print("OPTIMIZED DATASET - STANDALONE TEST")
-    print("="*70)
-    
-    print_dataset_info()
-    
-    # Test sample
-    texts, labels = get_clustered_sample(10)
-    print(f"\nSample test: {len(texts)} texts, {sum(labels)} positive")
-    
-    # Test DataLoader
-    batch = next(iter(test_loader))
-    print(f"DataLoader test: {batch['input_ids'].shape}")
-    
-    print(f"\nAll tests passed! Dataset ready for XAI experiments.")
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--rebuild", action="store_true", help="Ricostruisce il campione da Test.csv")
+    a = p.parse_args()
+    d = get_dataset(rebuild=a.rebuild)
+    pos = int((d["label"] == 1).sum())
+    print(f"{len(d)} recensioni: {pos} positive, {len(d) - pos} negative")

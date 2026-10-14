@@ -1,511 +1,331 @@
 """
-metrics_simplified.py – Metriche XAI Evalutation
-================================================================
-Metriche implementate:
-- Robustness: stabilità sotto perturbazioni
-- Consistency: stabilità con inference seed diversi
-- Contrastivity: diversità tra classi opposte
+metrics.py – Robustness, Consistency e Contrastivity come definite nella tesi (cap. 3.1)
+======================================================================================
+
+Il modulo non dipende da PyTorch: le metriche ricevono l'explainer come funzione
+`testo -> Attribution` e la funzione che fissa i seed, quindi si possono verificare
+anche con explainer finti.
+
+Robustness (pp. 45-47, eq. 3.1-3.3)
+    Per ogni testo x e ogni perturbazione x' in P: dissimilarità media |s_t(x) - s'_t(x')|
+    sulle parole presenti in entrambe le spiegazioni, con punteggi normalizzati in
+    [0, 1]. Robustness(x) = media sulle perturbazioni; poi media sui testi.
+    Più basso = più stabile.
+
+Consistency (pp. 47-49, eq. 3.4-3.6)
+    Stesso testo, dropout attivo, quattro seed (42, 123, 456, 789): media delle sei
+    correlazioni di Spearman tra coppie di spiegazioni; poi media e deviazione
+    standard (N-1) sui testi.
+
+Contrastivity (pp. 49-50)
+    Somma dei punteggi per parola nelle spiegazioni dei testi positivi e negativi,
+    normalizzazione a distribuzione (sottraendo il minimo), vocabolario ristretto
+    alle 1.000 parole più frequenti, D_KL(P+ || P-) in base 2 con eps = 1e-10.
+    La tesi non dice su quale scala sommare i punteggi. Qui ogni spiegazione è
+    divisa per il suo massimo valore assoluto: il segno resta (serve al passo
+    "S - min S") e ogni testo pesa allo stesso modo. Con i punteggi in [0, 1] della
+    robustness tutte le parole assenti da una classe avrebbero S = 0 = min S, quindi
+    probabilità 0, e la divergenza sarebbe dominata da eps. Per come è scritta la
+    formula, la parola con S minimo ha comunque probabilità 0: il conteggio è in
+    `n_vocab_zero_in_neg`.
+
+Valori non calcolabili (per esempio una spiegazione costante, per cui Spearman non è
+definita) sono NaN: vengono esclusi dalle medie e contati, non sostituiti con
+valori arbitrari.
 """
 
+import math
 import random
+import re
+import warnings
+from collections import Counter
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
-import torch
-import torch.nn.functional as F
-from typing import List, Callable, Tuple
-from transformers import PreTrainedModel, PreTrainedTokenizer
-from scipy.stats import spearmanr, entropy
-from tqdm import tqdm
-from explainers import Attribution
-import models
+from scipy.stats import spearmanr
 
-# ==== Parametri configurazione ====
-DEFAULT_PERTURBATION_RATIO = 0.15
-MIN_SHARED_TOKENS = 2
-RANDOM_STATE = 42
+from attribution import Attribution
 
-# Parametri consistency
-DEFAULT_CONSISTENCY_SEEDS = [42, 123, 456, 789]
-MAX_CONSISTENCY_SAMPLES = 100  # Bilanciamento tra accuratezza e velocità
+# ==== Parametri della tesi ====
+PERTURBATION_RATIO = 0.15                       # rho, p. 47
+N_PERTURBATIONS_PER_TYPE = 2                    # perturbazioni per strategia (|P| = 6)
+CONSISTENCY_SEEDS = [42, 123, 456, 789]         # p. 48
+CONTRASTIVITY_VOCAB_SIZE = 1000                 # p. 50
+KL_EPSILON = 1e-10                              # p. 50
+EXPLANATION_SEED = 42                           # seed fisso per le spiegazioni senza dropout
 
-# ==== Memory Management ====
-def clear_memory_if_needed():
-    """Cleanup memoria se necessario."""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / (1024**3)
-        if allocated > 8.0:
-            models.clear_gpu_memory()
+# ==== Dizionario di sinonimi (Random Substitution, p. 46) ====
+# Sostituzioni di una parola con un'altra di significato e polarità equivalenti.
+# Il dizionario della versione della tesi aveva 12 voci, e in gran parte dei testi
+# non trovava nulla da sostituire: qui è esteso a parole frequenti nelle recensioni.
+SYNONYMS: Dict[str, str] = {
+    # cinema
+    "movie": "film", "film": "movie", "movies": "films", "films": "movies",
+    "actor": "performer", "actors": "performers", "actress": "performer",
+    "director": "filmmaker", "story": "tale", "plot": "storyline", "storyline": "plot",
+    "scene": "sequence", "scenes": "sequences", "character": "role", "characters": "roles",
+    "cast": "ensemble", "ending": "finale", "audience": "viewers", "viewers": "audience",
+    "picture": "film", "flick": "movie", "series": "show",
+    "role": "part", "roles": "parts", "screenplay": "script", "script": "screenplay",
+    "watch": "view", "watched": "viewed", "watching": "viewing", "saw": "watched",
+    "seen": "watched", "performance": "portrayal", "performances": "portrayals",
+    # aggettivi positivi
+    "good": "fine", "great": "terrific", "nice": "pleasant", "excellent": "outstanding",
+    "amazing": "astonishing", "wonderful": "marvelous", "fantastic": "fabulous",
+    "beautiful": "lovely", "brilliant": "superb", "superb": "brilliant",
+    "enjoyable": "entertaining", "entertaining": "enjoyable", "funny": "hilarious",
+    "interesting": "intriguing", "best": "finest", "favorite": "preferred",
+    "perfect": "flawless", "loved": "adored", "love": "adore",     "liked": "enjoyed", "enjoyed": "liked", "recommend": "suggest",     # aggettivi negativi
+    "bad": "poor", "poor": "weak", "terrible": "awful", "awful": "dreadful",
+    "horrible": "terrible", "boring": "dull", "dull": "tedious", "worst": "poorest",
+    "stupid": "dumb", "dumb": "stupid", "waste": "squander", "hate": "loathe",
+    "hated": "loathed", "annoying": "irritating", "ridiculous": "absurd",
+    "silly": "foolish", "weak": "feeble", "mess": "shambles", "disappointing": "underwhelming",
+    "pointless": "meaningless", "lame": "feeble",
+    # parole frequenti neutre
+    "very": "really", "really": "truly", "quite": "rather",     "lot": "great deal", "many": "numerous", "big": "large", "small": "little",
+    "little": "small",     "begin": "start", "people": "folks",
+    "man": "guy", "guy": "man", "woman": "lady", "kids": "children", "children": "kids",
+    "old": "aged", "new": "recent", "real": "genuine", "whole": "entire", "entire": "whole",
+    "think": "believe", "thought": "believed", "know": "realize", "seems": "appears",
+    "seemed": "appeared", "made": "created",     "find": "discover", "found": "discovered",
+    "also": "too", "almost": "nearly", "probably": "likely", "actually": "really",
+    "completely": "totally", "totally": "completely", "especially": "particularly",
+    "simply": "just", "just": "simply", "maybe": "perhaps", "however": "nevertheless",
+    "because": "since", "although": "though", "though": "although",     "fact": "truth", "part": "portion",
+    "minutes": "mins", "world": "globe",
+    "life": "existence", "family": "household", "friends": "pals", "house": "home",
+    "home": "house", "town": "city", "city": "town", "car": "vehicle",
+}
 
-# ==== Perturbation Functions ====
-def _random_mask(text: str, ratio: float = DEFAULT_PERTURBATION_RATIO, mask_token: str = "[MASK]") -> str:
-    """Maschera parole casuali."""
-    if not text.strip():
-        return text
-    
-    tokens = text.split()
-    if len(tokens) <= 1:
-        return text
-    
-    n_to_mask = max(1, int(len(tokens) * ratio))
-    n_to_mask = min(n_to_mask, len(tokens) - 1)
-    
-    try:
-        idx_to_mask = random.sample(range(len(tokens)), n_to_mask)
-        for i in idx_to_mask:
-            tokens[i] = mask_token
-        return " ".join(tokens)
-    except Exception:
-        return text
+_PUNCT_RE = re.compile(r"^(\W*)(.*?)(\W*)$", re.UNICODE)
 
-def _random_delete(text: str, ratio: float = DEFAULT_PERTURBATION_RATIO) -> str:
-    """Elimina parole casuali."""
-    if not text.strip():
-        return text
-    
-    tokens = text.split()
-    if len(tokens) <= 1:
-        return text
-    
-    n_to_delete = max(1, int(len(tokens) * ratio))
-    n_to_delete = min(n_to_delete, len(tokens) - 1)
-    
-    try:
-        idx_to_keep = random.sample(range(len(tokens)), len(tokens) - n_to_delete)
-        idx_to_keep.sort()
-        return " ".join(tokens[i] for i in idx_to_keep)
-    except Exception:
-        return text
 
-def _random_substitute(text: str, ratio: float = DEFAULT_PERTURBATION_RATIO) -> str:
-    """Sostituisce parole con sinonimi."""
-    substitutions = {
-        "good": "great", "bad": "terrible", "nice": "pleasant", "awful": "horrible",
-        "love": "like", "hate": "dislike", "amazing": "wonderful", "terrible": "bad",
-        "excellent": "good", "poor": "bad", "fantastic": "great", "boring": "dull"
-    }
-    
-    tokens = text.split()
-    if len(tokens) <= 1:
-        return text
-    
-    n_to_substitute = max(1, int(len(tokens) * ratio))
-    
-    try:
-        idx_to_substitute = random.sample(range(len(tokens)), min(n_to_substitute, len(tokens)))
-        for i in idx_to_substitute:
-            word = tokens[i].lower()
-            if word in substitutions:
-                tokens[i] = substitutions[word]
-        return " ".join(tokens)
-    except Exception:
-        return text
+def _substitute_word(word: str) -> Optional[str]:
+    """Sinonimo di `word` mantenendo punteggiatura e maiuscola iniziale, o None."""
+    m = _PUNCT_RE.match(word)
+    pre, core, post = m.group(1), m.group(2), m.group(3)
+    syn = SYNONYMS.get(core.lower())
+    if syn is None or not core:
+        return None
+    if core[0].isupper():
+        syn = syn[0].upper() + syn[1:]
+    return pre + syn + post
 
-PERTURBATION_FUNCTIONS = [_random_mask, _random_delete, _random_substitute]
 
-# ==== 1. ROBUSTNESS ====
-def compute_robustness(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    explainer: Callable[[str], Attribution],
-    text: str,
-    n_perturbations: int = 2
-) -> float:
-    """Calcola robustness con perturbazioni."""
-    try:
-        # Attribution originale
-        orig_attr = explainer(text)
-        if not orig_attr.tokens or not orig_attr.scores:
-            return 0.0
-        
-        all_diffs = []
-        
-        for perturb_func in PERTURBATION_FUNCTIONS:
-            for _ in range(n_perturbations):
-                try:
-                    # Perturbazione
-                    pert_text = perturb_func(text)
-                    if pert_text == text:
-                        continue
-                    
-                    # Attribution perturbata
-                    pert_attr = explainer(pert_text)
-                    if not pert_attr.tokens or not pert_attr.scores:
-                        continue
-                    
-                    # Calcola differenze per token condivisi
-                    score_diffs = []
-                    for tok, score in zip(orig_attr.tokens, orig_attr.scores):
-                        if tok in pert_attr.tokens:
-                            j = pert_attr.tokens.index(tok)
-                            diff = abs(score - pert_attr.scores[j])
-                            score_diffs.append(diff)
-                    
-                    if score_diffs:
-                        all_diffs.extend(score_diffs)
-                        
-                except Exception:
-                    continue
-        
-        return float(np.mean(all_diffs)) if all_diffs else 0.0
-        
-    except Exception:
-        return 0.0
+# ==== Perturbazioni (p. 46) ====
+# Ognuna restituisce (parole perturbate, coppie (indice originale, indice perturbato)
+# delle parole rimaste identiche), oppure None se la perturbazione non è applicabile.
+Perturbation = Tuple[List[str], List[Tuple[int, int]]]
 
-def evaluate_robustness_over_dataset(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    explainer: Callable[[str], Attribution],
-    texts: List[str],
-    show_progress: bool = True,
-) -> float:
-    """Valuta robustness su dataset."""
-    try:
-        robustness_scores = []
-        iterator = tqdm(texts, desc="Robustness", leave=False) if show_progress else texts
-        
-        for i, text in enumerate(iterator):
-            try:
-                if text.strip():
-                    score = compute_robustness(model, tokenizer, explainer, text)
-                    robustness_scores.append(score)
-                
-                # Cleanup periodico
-                if i % 50 == 0:
-                    clear_memory_if_needed()
-                    
-            except Exception:
-                continue
-        
-        return float(np.mean(robustness_scores)) if robustness_scores else 0.0
-        
-    except Exception:
-        return 0.0
 
-# ==== 2. CONSISTENCY (CORRECT LOGIC) ====
-def _compute_single_observation_correlation(attr_a: Attribution, attr_b: Attribution) -> float:
-    """Calcola correlazione di Spearman tra due explanations della STESSA osservazione."""
-    
-    # Check explanations vuote
-    if not attr_a.tokens or not attr_b.tokens:
-        return 0.1  # Fallback: correlazione bassa ma non zero
-    
-    # Token matching flessibile (case-insensitive)
-    shared_scores_a, shared_scores_b = [], []
-    
-    tokens_b_dict = {tok.lower(): i for i, tok in enumerate(attr_b.tokens)}
-    
-    for token, score_a in zip(attr_a.tokens, attr_a.scores):
-        token_key = token.lower()
-        if token_key in tokens_b_dict:
-            idx = tokens_b_dict[token_key]
-            shared_scores_a.append(score_a)
-            shared_scores_b.append(attr_b.scores[idx])
-    
-    # Soglia: almeno 1 token condiviso
-    if len(shared_scores_a) >= 1:
-        arr_a = np.array(shared_scores_a)
-        arr_b = np.array(shared_scores_b)
-        
-        # Check validità
-        if np.any(np.isnan(arr_a)) or np.any(np.isnan(arr_b)):
-            return 0.0
-        if np.any(np.isinf(arr_a)) or np.any(np.isinf(arr_b)):
-            return 0.0
-        
-        # Check varianza
-        if np.var(arr_a) < 1e-12 and np.var(arr_b) < 1e-12:
-            return 1.0 if np.allclose(arr_a, arr_b) else 0.0
-        elif np.var(arr_a) < 1e-12 or np.var(arr_b) < 1e-12:
-            return 0.0
-        
-        # Calcolo Spearman
-        try:
-            rho, _ = spearmanr(arr_a, arr_b)
-            return float(rho) if not np.isnan(rho) else 0.0
-        except Exception:
-            return 0.0
-    else:
-        return 0.05  # Correlazione molto bassa
+def _n_to_change(n_words: int, ratio: float) -> int:
+    # floor(rho * |x|) come nella tesi, con almeno una parola cambiata e almeno una intatta
+    return min(max(1, math.floor(ratio * n_words)), n_words - 1)
 
-def compute_consistency_inference_seed_CORRECT(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    explainer: Callable[[str], Attribution],
-    texts: List[str],
-    seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS,
-    show_progress: bool = True
-) -> Tuple[float, float]:
-    """
-    LOGICA CORRETTA per Consistency:
-    
-    1. Per ogni osservazione i:
-       - Genera explanations con 4 seed diversi
-       - Calcola 6 correlazioni tra coppie di seed (C(4,2) = 6)
-       - Calcola MEDIA delle 6 correlazioni → spearman_mean_i
-    
-    2. Su tutto il dataset (N osservazioni):
-       - Array: [spearman_mean_1, spearman_mean_2, ..., spearman_mean_N]
-       - MEAN = Σ(spearman_mean_i) / N
-       - STD = std([spearman_mean_1, spearman_mean_2, ..., spearman_mean_N])
-    
-    3. Tabella finale: MEAN ± STD
-    
-    Limitato a MAX_CONSISTENCY_SAMPLES = 100 
-    """
-    
-    # Applica limite per gestire complessità computazionale O(n × seeds²)
-    if len(texts) > MAX_CONSISTENCY_SAMPLES:
-        print(f"[CONSISTENCY] Limiting to {MAX_CONSISTENCY_SAMPLES} samples (from {len(texts)}) for computational efficiency")
-        texts = texts[:MAX_CONSISTENCY_SAMPLES]
-    
-    if show_progress:
-        print(f"[CONSISTENCY-CORRECT] {len(seeds)} seeds, {len(texts)} observations")
-        print(f"[CONSISTENCY-CORRECT] Will compute {len(seeds)*(len(seeds)-1)//2} correlations per observation")
-        estimated_time = len(texts) * 0.8  # ~0.8 min per observation
-        print(f"[CONSISTENCY-CORRECT] Estimated time: ~{estimated_time:.1f} minutes")
-    
-    # Setup modello per dropout
-    original_mode = model.training
-    model.train()
-    
-    original_requires_grad = {}
-    for name, param in model.named_parameters():
-        original_requires_grad[name] = param.requires_grad
-        param.requires_grad_(False)
-    
-    try:
-        # Array per memorizzare spearman_mean per ogni osservazione
-        per_observation_mean_spearman = []
-        
-        # LOOP PRINCIPALE: Per ogni osservazione
-        for obs_idx, text in enumerate(texts):
-            if show_progress and obs_idx % 20 == 0:  # Progress ogni 20
-                print(f"  [OBS] {obs_idx + 1}/{len(texts)}")
-            
-            # STEP 1: Genera explanations per tutti i seed per questa osservazione
-            obs_explanations = {}
-            
-            for seed in seeds:
-                # Set seed per dropout
-                random.seed(seed)
-                np.random.seed(seed)
-                torch.manual_seed(seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(seed)
-                
-                try:
-                    attr = explainer(text)
-                    obs_explanations[seed] = attr
-                except Exception:
-                    obs_explanations[seed] = Attribution([], [])
-            
-            # STEP 2: Calcola correlazioni tra tutte le coppie di seed per questa osservazione
-            obs_correlations = []
-            
-            for i, seed_a in enumerate(seeds):
-                for seed_b in seeds[i+1:]:
-                    attr_a = obs_explanations[seed_a]
-                    attr_b = obs_explanations[seed_b]
-                    
-                    # Calcola correlazione
-                    correlation = _compute_single_observation_correlation(attr_a, attr_b)
-                    
-                    # Aggiungi solo se valida
-                    if not np.isnan(correlation) and not np.isinf(correlation):
-                        obs_correlations.append(correlation)
-            
-            # STEP 3: Calcola media delle correlazioni per questa osservazione
-            if obs_correlations:
-                spearman_mean_i = np.mean(obs_correlations)
+
+def perturb_mask(words: List[str], rng: random.Random, ratio: float = PERTURBATION_RATIO,
+                 mask_token: str = "[MASK]") -> Optional[Perturbation]:
+    """Random Masking: floor(rho·|x|) parole casuali sostituite con il token di mask
+    del tokenizer ([MASK] per BERT, <mask> per RoBERTa)."""
+    n = len(words)
+    if n < 2:
+        return None
+    idx = set(rng.sample(range(n), _n_to_change(n, ratio)))
+    new = [mask_token if i in idx else w for i, w in enumerate(words)]
+    pairs = [(i, i) for i in range(n) if i not in idx]
+    return new, pairs
+
+
+def perturb_delete(words: List[str], rng: random.Random, ratio: float = PERTURBATION_RATIO,
+                   **_) -> Optional[Perturbation]:
+    """Random Deletion: floor(rho·|x|) parole casuali eliminate."""
+    n = len(words)
+    if n < 2:
+        return None
+    drop = set(rng.sample(range(n), _n_to_change(n, ratio)))
+    kept = [i for i in range(n) if i not in drop]
+    return [words[i] for i in kept], [(i, j) for j, i in enumerate(kept)]
+
+
+def perturb_substitute(words: List[str], rng: random.Random, ratio: float = PERTURBATION_RATIO,
+                       **_) -> Optional[Perturbation]:
+    """Random Substitution: fino a floor(rho·|x|) parole sostituite con un sinonimo
+    del dizionario, scelte a caso tra quelle che ne hanno uno. Una sostituzione può
+    produrre due parole ("lot" -> "great deal"): le coppie tengono conto dello spostamento."""
+    n = len(words)
+    cand = [i for i, w in enumerate(words) if _substitute_word(w) is not None]
+    if n < 2 or not cand:
+        return None
+    k = min(_n_to_change(n, ratio), len(cand))
+    chosen = set(rng.sample(cand, k))
+    new, pairs = [], []
+    for i, w in enumerate(words):
+        if i in chosen:
+            new.extend(_substitute_word(w).split(" "))
+        else:
+            pairs.append((i, len(new)))
+            new.append(w)
+    return new, pairs
+
+
+PERTURBATIONS = {"mask": perturb_mask, "delete": perturb_delete, "substitute": perturb_substitute}
+
+
+def make_perturbations(text: str, text_seed: int, mask_token: str,
+                       n_per_type: int = N_PERTURBATIONS_PER_TYPE,
+                       ratio: float = PERTURBATION_RATIO) -> List[dict]:
+    """Insieme P delle perturbazioni di un testo, riproducibile dato `text_seed`."""
+    words = text.split(" ")
+    out = []
+    for name, fn in PERTURBATIONS.items():
+        for k in range(n_per_type):
+            rng = random.Random(f"{text_seed}-{name}-{k}")
+            res = fn(words, rng, ratio=ratio, mask_token=mask_token)
+            if res is None:
+                out.append({"type": name, "k": k, "text": None, "pairs": []})
             else:
-                spearman_mean_i = 0.1  # Valore neutro basso
-                
-            per_observation_mean_spearman.append(spearman_mean_i)
-            
-            # Cleanup periodico ogni 25 osservazioni
-            if obs_idx > 0 and obs_idx % 25 == 0:
-                clear_memory_if_needed()
-        
-        # STEP 4: Calcola statistiche finali su tutto il dataset
-        if per_observation_mean_spearman:
-            # QUESTA È LA LOGICA CORRETTA
-            final_mean = np.mean(per_observation_mean_spearman)  # Media degli spearman_mean_i
-            final_std = np.std(per_observation_mean_spearman, ddof=1)  # Std degli spearman_mean_i
-        else:
-            final_mean = 0.0
-            final_std = 0.0
-        
-        if show_progress:
-            print(f"  [RESULT] Final: {final_mean:.4f} ± {final_std:.4f}")
-            print(f"  [RESULT] Based on {len(per_observation_mean_spearman)} observations")
-        
-        return final_mean, final_std
-        
-    finally:
-        # Ripristina stato modello
-        model.train(original_mode)
-        for name, param in model.named_parameters():
-            param.requires_grad_(original_requires_grad[name])
+                new, pairs = res
+                out.append({"type": name, "k": k, "text": " ".join(new), "pairs": pairs})
+    return out
 
-def evaluate_consistency_over_dataset(
-    model: PreTrainedModel,
-    tokenizer: PreTrainedTokenizer,
-    explainer: Callable[[str], Attribution],
-    texts: List[str],
-    seeds: List[int] = DEFAULT_CONSISTENCY_SEEDS,
-    show_progress: bool = True
-) -> Tuple[float, float]:
-    """Wrapper per consistency evaluation che restituisce (media, std)."""
-    return compute_consistency_inference_seed_CORRECT(
-        model=model,
-        tokenizer=tokenizer,
-        explainer=explainer,
-        texts=texts,
-        seeds=seeds,
-        show_progress=show_progress
-    )
 
-# ==== 3. CONTRASTIVITY ====
-def _normalize_scores_for_distribution(scores: List[float]) -> np.ndarray:
-    """Normalizza scores per distribuzione di probabilità."""
-    arr = np.array(scores, dtype=float)
-    
-    # Sposta a valori non-negativi
-    arr = arr - np.min(arr)
-    
-    # Normalizza
-    total = np.sum(arr)
-    if total == 0:
-        return np.ones(len(arr)) / len(arr)
-    
-    return arr / total
+# ==== Seed ====
+def default_set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
 
-def compute_contrastivity(
-    positive_attrs: List[Attribution],
-    negative_attrs: List[Attribution],
-    use_jensen_shannon: bool = False,
-) -> float:
-    """Calcola contrastivity con gestione memoria."""
-    try:
-        if not positive_attrs or not negative_attrs:
-            return 0.0
-        
-        # Accumula token scores per classe
-        token_scores_pos = {}
-        token_scores_neg = {}
-        
-        def accumulate_scores(score_dict: dict, attr: Attribution):
-            for tok, score in zip(attr.tokens, attr.scores):
-                if tok.strip() and tok not in ['[CLS]', '[SEP]', '[PAD]', '[ERROR]']:
-                    score_dict[tok] = score_dict.get(tok, 0.0) + score
-        
-        # Accumula scores
-        for attr in positive_attrs:
-            accumulate_scores(token_scores_pos, attr)
-        for attr in negative_attrs:
-            accumulate_scores(token_scores_neg, attr)
-        
-        # Vocabolario unificato
-        vocab = set(token_scores_pos.keys()) | set(token_scores_neg.keys())
-        if len(vocab) < 2:
-            return 0.0
-        
-        vocab = sorted(vocab)[:1000]  # Limita per memoria
-        
-        # Distribuzioni
-        pos_scores = [token_scores_pos.get(tok, 0.0) for tok in vocab]
-        neg_scores = [token_scores_neg.get(tok, 0.0) for tok in vocab]
-        
-        p = _normalize_scores_for_distribution(pos_scores)
-        q = _normalize_scores_for_distribution(neg_scores)
-        
-        # Calcola divergenza
-        if use_jensen_shannon:
-            m = 0.5 * (p + q)
-            js_div = 0.5 * entropy(p, m, base=2) + 0.5 * entropy(q, m, base=2)
-            return float(js_div)
-        else:
-            epsilon = 1e-10
-            q_smooth = q + epsilon
-            kl_div = entropy(p, q_smooth, base=2)
-            return float(kl_div)
-            
-    except Exception:
-        return 0.0
 
-# ==== Batch Processing Utilities ====
-def process_attributions_batch(
-    texts: List[str], 
-    explainer: Callable[[str], Attribution],
-    batch_size: int = 10,
-    show_progress: bool = True
-) -> List[Attribution]:
-    """Processa attributions in batch con memory management."""
-    results = []
-    
-    # Dividi in batch
-    batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
-    iterator = tqdm(batches, desc="Processing batch", leave=False) if show_progress else batches
-    
-    for batch in iterator:
-        batch_results = []
-        for text in batch:
-            try:
-                attr = explainer(text)
-                batch_results.append(attr)
-            except Exception:
-                batch_results.append(Attribution([], []))
-        
-        results.extend(batch_results)
-        
-        # Cleanup ogni batch
-        clear_memory_if_needed()
-    
-    return results
+# ==== 1. Robustness ====
+def dissimilarity(orig: Attribution, pert: Attribution, pairs: Sequence[Tuple[int, int]]) -> float:
+    """Eq. 3.2: media di |s_t(x) - s'_t(x')| sulle parole condivise (visibili in entrambe)."""
+    a, b = orig.scores, pert.scores
+    diffs = [abs(a[i] - b[j]) for i, j in pairs if i < len(a) and j < len(b)]
+    return float(np.mean(diffs)) if diffs else float("nan")
 
-# ==== Test Function (minimal) ====
-if __name__ == "__main__":
-    print("Testing simplified metrics...")
-    
-    try:
-        import models
-        model = models.load_model("tinybert")
-        tokenizer = models.load_tokenizer("tinybert")
-        
-        # Mock explainer per test
-        def mock_explainer(text):
-            tokens = text.split()[:5]
-            scores = np.random.rand(len(tokens)).tolist()
-            return Attribution(tokens, scores)
-        
-        test_texts = [
-            "This movie is great!",
-            "This movie is terrible.",
-            "An okay film."
-        ]
-        
-        print("\nTesting Robustness...")
-        robustness = evaluate_robustness_over_dataset(
-            model, tokenizer, mock_explainer, test_texts, show_progress=False
-        )
-        print(f"Robustness: {robustness:.4f}")
-        
-        print("\nTesting Consistency (CORRECT LOGIC)...")
-        mean_consistency, std_consistency = evaluate_consistency_over_dataset(
-            model, tokenizer, mock_explainer, test_texts[:2], 
-            seeds=[42, 123], show_progress=False
-        )
-        print(f"Consistency: {mean_consistency:.4f} ± {std_consistency:.4f}")
-        
-        print("\nTesting Contrastivity...")
-        pos_attrs = [mock_explainer(test_texts[0])]
-        neg_attrs = [mock_explainer(test_texts[1])]
-        contrastivity = compute_contrastivity(pos_attrs, neg_attrs)
-        print(f"Contrastivity: {contrastivity:.4f}")
-        
-        print("\n Simplified metrics test completed!")
-        
-    except Exception as e:
-        print(f"Test failed: {e}")
-    
-    finally:
-        models.clear_gpu_memory()
+
+def robustness_for_text(explain: Callable[[str], Attribution], text: str, orig: Attribution,
+                        perturbations: List[dict], set_seed: Callable[[int], None] = default_set_seed,
+                        seed: int = EXPLANATION_SEED) -> dict:
+    """Eq. 3.1 per un testo. `orig` è la spiegazione del testo originale."""
+    per_pert = []
+    for p in perturbations:
+        if p["text"] is None:
+            per_pert.append({"type": p["type"], "value": None, "status": "not_applicable"})
+            continue
+        try:
+            set_seed(seed)
+            pert_attr = explain(p["text"])
+            d = dissimilarity(orig, pert_attr, p["pairs"])
+            status = "ok" if np.isfinite(d) else "no_shared_words"
+        except Exception as e:  # registrato, non trasformato in un punteggio
+            d, status = float("nan"), f"error: {type(e).__name__}: {e}"[:200]
+        per_pert.append({"type": p["type"], "value": None if not np.isfinite(d) else d, "status": status})
+    vals = [x["value"] for x in per_pert if x["value"] is not None]
+    return {"robustness": float(np.mean(vals)) if vals else None, "perturbations": per_pert}
+
+
+def aggregate_robustness(per_text: Sequence[Optional[float]]) -> dict:
+    """Eq. 3.3: media sui testi con un valore definito."""
+    vals = np.array([v for v in per_text if v is not None], dtype=float)
+    return {"mean": float(vals.mean()) if len(vals) else None,
+            "std": float(vals.std(ddof=1)) if len(vals) > 1 else None,
+            "n_valid": int(len(vals)), "n_total": int(len(per_text))}
+
+
+# ==== 2. Consistency ====
+def spearman_same_text(a: Attribution, b: Attribution) -> float:
+    """Spearman tra due spiegazioni dello stesso testo, parola per parola (stessa posizione).
+
+    NaN se le spiegazioni hanno lunghezze diverse o se una delle due è costante."""
+    if len(a.scores) != len(b.scores) or len(a.scores) < 2:
+        return float("nan")
+    x, y = np.asarray(a.raw_scores, float), np.asarray(b.raw_scores, float)
+    if np.ptp(x) == 0 or np.ptp(y) == 0:
+        return float("nan")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        rho = spearmanr(x, y)[0]
+    return float(rho)
+
+
+def consistency_for_text(explain: Callable[[str], Attribution], text: str,
+                         seeds: Sequence[int] = CONSISTENCY_SEEDS,
+                         set_seed: Callable[[int], None] = default_set_seed) -> dict:
+    """Eq. 3.4 per un testo: media delle correlazioni tra le coppie di seed.
+
+    Il dropout va acceso dal chiamante (model.train()) prima di chiamare questa funzione."""
+    attrs, errors = {}, []
+    for s in seeds:
+        try:
+            set_seed(s)
+            attrs[s] = explain(text)
+        except Exception as e:
+            errors.append(f"seed {s}: {type(e).__name__}: {e}"[:200])
+    corrs = []
+    for i, sa in enumerate(seeds):
+        for sb in seeds[i + 1:]:
+            if sa in attrs and sb in attrs:
+                corrs.append(spearman_same_text(attrs[sa], attrs[sb]))
+    valid = [c for c in corrs if np.isfinite(c)]
+    return {"consistency": float(np.mean(valid)) if valid else None,
+            "pair_correlations": [None if not np.isfinite(c) else c for c in corrs],
+            "n_valid_pairs": len(valid), "errors": errors}
+
+
+def aggregate_consistency(per_text: Sequence[Optional[float]]) -> dict:
+    """Eq. 3.5-3.6: media e deviazione standard campionaria (N-1) sui testi."""
+    vals = np.array([v for v in per_text if v is not None], dtype=float)
+    return {"mean": float(vals.mean()) if len(vals) else None,
+            "std": float(vals.std(ddof=1)) if len(vals) > 1 else None,
+            "n_valid": int(len(vals)), "n_total": int(len(per_text))}
+
+
+# ==== 3. Contrastivity ====
+_STRIP_RE = re.compile(r"^\W+|\W+$", re.UNICODE)
+
+
+def normalize_word(word: str) -> str:
+    """Forma della parola usata per il vocabolario: minuscolo, senza punteggiatura ai bordi."""
+    return _STRIP_RE.sub("", word.lower())
+
+
+def contrastivity(pos_attrs: Sequence[Attribution], neg_attrs: Sequence[Attribution],
+                  vocab_size: int = CONTRASTIVITY_VOCAB_SIZE, eps: float = KL_EPSILON,
+                  exclude: Sequence[str] = (), scale: str = "signed") -> dict:
+    """D_KL(P+ || P-) in base 2 (p. 50).
+
+    1. S_c(t) = somma dei punteggi della parola t nelle spiegazioni della classe c;
+    2. P_c(t) = (S_c(t) - min S_c) / somma(S_c - min S_c), sul vocabolario V;
+    3. V = le `vocab_size` parole più frequenti (occorrenze in tutte le spiegazioni,
+       a parità di frequenza in ordine alfabetico).
+
+    scale: "signed" (default, punteggi / max|punteggio|), "raw" o "minmax01"."""
+    pick = {"signed": lambda a: a.signed_scores, "raw": lambda a: a.raw_scores,
+            "minmax01": lambda a: a.scores}[scale]
+    exclude = {normalize_word(w) for w in exclude}
+    S = {"pos": Counter(), "neg": Counter()}
+    freq = Counter()
+    for cls, attrs in (("pos", pos_attrs), ("neg", neg_attrs)):
+        for a in attrs:
+            for w, s in zip(a.words, pick(a)):
+                t = normalize_word(w)
+                if not t or t in exclude:
+                    continue
+                S[cls][t] += float(s)
+                freq[t] += 1
+    if len(freq) < 2 or not pos_attrs or not neg_attrs:
+        return {"contrastivity": None, "vocab_size": len(freq)}
+    vocab = [t for t, _ in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:vocab_size]]
+
+    def dist(counter):
+        v = np.array([counter.get(t, 0.0) for t in vocab], dtype=float)
+        v = v - v.min()
+        tot = v.sum()
+        return v / tot if tot > 0 else np.full(len(v), 1.0 / len(v))
+
+    p, q = dist(S["pos"]), dist(S["neg"])
+    mask = p > 0
+    kl = float(np.sum(p[mask] * np.log2(p[mask] / (q[mask] + eps))))
+    return {"contrastivity": kl, "vocab_size": len(vocab), "n_pos": len(pos_attrs), "n_neg": len(neg_attrs),
+            "scale": scale, "n_vocab_zero_in_neg": int(np.sum(mask & (q == 0)))}

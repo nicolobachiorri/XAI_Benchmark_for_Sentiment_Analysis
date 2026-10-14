@@ -1,201 +1,106 @@
 """
-utils.py – Essential utilities for Google Colab XAI Benchmark
-===========================================================
-
+utils.py – Seed, tempi e file di risultato
+=========================================
 """
 
 import json
-import random
-import time
-import gc
 import os
-import warnings
+import random
+import subprocess
+import time
 from pathlib import Path
-from typing import Any, List, TypeVar, Optional, Dict
-from datetime import datetime
+from typing import Any
 
 import numpy as np
-import torch
-from tqdm.auto import tqdm
 
-T = TypeVar("T")
 
-# ==== Environment Setup ====
-def setup_colab_environment():
-    """Setup ottimale per Google Colab."""
-    warnings.filterwarnings("ignore", category=UserWarning, module="torch")
-    warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
-    warnings.filterwarnings("ignore", category=DeprecationWarning)
-    
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["OMP_NUM_THREADS"] = "1"
-    
+def set_seed(seed: int) -> None:
+    """Fissa i seed di random, numpy e torch (dropout, campionamenti di LIME e SHAP)."""
+    random.seed(seed)
+    np.random.seed(seed)
     try:
-        import matplotlib
-        matplotlib.use('Agg')
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
     except ImportError:
         pass
 
-# Auto setup
-setup_colab_environment()
 
-# ==== Seed Management ====
-def set_seed(seed: int) -> None:
-    """Fissa seed per riproducibilità completa."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-# ==== Memory Management ====
-def get_memory_usage() -> Dict[str, float]:
-    """Ottieni uso memoria corrente."""
-    usage = {}
-    
-    # RAM
-    try:
-        import psutil
-        ram_info = psutil.virtual_memory()
-        usage["ram_used_gb"] = ram_info.used / (1024**3)
-        usage["ram_total_gb"] = ram_info.total / (1024**3)
-        usage["ram_percent"] = ram_info.percent
-    except ImportError:
-        usage["ram_used_gb"] = 0.0
-        usage["ram_total_gb"] = 0.0
-        usage["ram_percent"] = 0.0
-    
-    # GPU
-    if torch.cuda.is_available():
-        usage["gpu_allocated_gb"] = torch.cuda.memory_allocated() / (1024**3)
-        usage["gpu_total_gb"] = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        usage["gpu_percent"] = (usage["gpu_allocated_gb"] / usage["gpu_total_gb"]) * 100
-    else:
-        usage["gpu_allocated_gb"] = 0.0
-        usage["gpu_total_gb"] = 0.0
-        usage["gpu_percent"] = 0.0
-    
-    return usage
-
-def print_memory_status():
-    """Stampa status memoria."""
-    usage = get_memory_usage()
-    print(f"Memory - RAM: {usage['ram_used_gb']:.1f}GB ({usage['ram_percent']:.1f}%) "
-          f"GPU: {usage['gpu_allocated_gb']:.1f}GB ({usage['gpu_percent']:.1f}%)")
-
-def aggressive_cleanup():
-    """Cleanup aggressivo per Colab."""
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-    gc.collect()
-
-# ==== Performance Tracking ====
 class Timer:
-    """Timer semplice con memoria."""
-    
-    def __init__(self, name: str = "Operation", track_memory: bool = True):
-        self.name = name
-        self.track_memory = track_memory
-        self.start_time = None
-        self.start_memory = None
-        
+    def __init__(self, name: str = "Operation", verbose: bool = True):
+        self.name, self.verbose = name, verbose
+        self.elapsed = 0.0
+
     def __enter__(self):
-        self.start_time = time.time()
-        if self.track_memory:
-            self.start_memory = get_memory_usage()
-        print(f"[START] {self.name}...")
+        self.start = time.time()
         return self
-        
+
     def __exit__(self, *args):
-        duration = time.time() - self.start_time
-        print(f"[DONE] {self.name} completed in {self.format_time(duration)}")
-        
-        if self.track_memory and self.start_memory:
-            end_memory = get_memory_usage()
-            ram_delta = end_memory["ram_used_gb"] - self.start_memory["ram_used_gb"]
-            gpu_delta = end_memory["gpu_allocated_gb"] - self.start_memory["gpu_allocated_gb"]
-            
-            if abs(ram_delta) > 0.1 or abs(gpu_delta) > 0.1:
-                print(f"[MEMORY] RAM: {ram_delta:+.2f}GB, GPU: {gpu_delta:+.2f}GB")
-    
-    @staticmethod
-    def format_time(seconds: float) -> str:
-        """Formatta tempo."""
-        if seconds < 60:
-            return f"{seconds:.1f}s"
-        elif seconds < 3600:
-            return f"{seconds//60:.0f}m {seconds%60:.0f}s"
-        else:
-            h = seconds // 3600
-            m = (seconds % 3600) // 60
-            return f"{h:.0f}h {m:.0f}m"
+        self.elapsed = time.time() - self.start
+        if self.verbose:
+            print(f"[TIME] {self.name}: {format_time(self.elapsed)}")
 
-class PerformanceProfiler:
-    """Profiler per tracking performance."""
-    
-    def __init__(self):
-        self.timings = {}
-    
-    def start_operation(self, name: str):
-        """Inizia tracking operazione."""
-        self.timings[name] = {
-            "start": time.time(),
-            "memory_start": get_memory_usage()
-        }
-    
-    def end_operation(self, name: str):
-        """Termina tracking operazione."""
-        if name in self.timings:
-            self.timings[name]["end"] = time.time()
-            self.timings[name]["memory_end"] = get_memory_usage()
-            self.timings[name]["duration"] = self.timings[name]["end"] - self.timings[name]["start"]
-    
-    def print_summary(self):
-        """Stampa summary performance."""
-        print(f"\n{'='*60}")
-        print("PERFORMANCE SUMMARY")
-        print(f"{'='*60}")
-        
-        for name, data in self.timings.items():
-            if "duration" in data:
-                ram_delta = data["memory_end"]["ram_used_gb"] - data["memory_start"]["ram_used_gb"]
-                gpu_delta = data["memory_end"]["gpu_allocated_gb"] - data["memory_start"]["gpu_allocated_gb"]
-                
-                print(f"{name:30s} {Timer.format_time(data['duration']):>10s} "
-                      f"RAM: {ram_delta:+6.2f}GB GPU: {gpu_delta:+6.2f}GB")
-        
-        print(f"{'='*60}")
 
-# ==== Essential File Operations ====
-def save_json(path: str, obj: Any) -> None:
-    """Salva JSON."""
+def format_time(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        return f"{seconds // 60:.0f}m {seconds % 60:.0f}s"
+    return f"{seconds // 3600:.0f}h {(seconds % 3600) // 60:.0f}m"
+
+
+def save_json(path, obj: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    
-    with open(path, "w") as f:
-        json.dump(obj, f, indent=2, default=str)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")  # unico per processo
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False, default=str)
+    os.replace(tmp, path)
 
-def load_json(path: str) -> Any:
-    """Carica JSON."""
+
+def load_json(path) -> Any:
     try:
-        with open(path, "r") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return None
 
-# ==== Initialize ====
-if __name__ == "__main__":
-    print("Testing essential utilities...")
-    set_seed(42)
-    print_memory_status()
-    
-    with Timer("Test operation"):
-        time.sleep(0.1)
-    
-    print("✓ Essential utilities working")
-else:
-    set_seed(42)
+
+def append_jsonl(path, obj: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # se un'interruzione ha lasciato l'ultima riga a metà, si va a capo prima di scrivere
+    prefix = ""
+    if path.exists() and path.stat().st_size > 0:
+        with open(path, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            if f.read(1) != b"\n":
+                prefix = "\n"
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(prefix + json.dumps(obj, ensure_ascii=False, default=str) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def read_jsonl(path) -> list:
+    """Righe valide di un file JSONL (un'ultima riga troncata da un'interruzione è ignorata)."""
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def git_commit() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent,
+                                       stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return "unknown"

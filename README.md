@@ -68,16 +68,19 @@ python report.py --out-dir runs/v2
 
 The run can be interrupted and restarted with the same command: each finished text is written immediately and skipped on restart.
 
-On Google Colab, [`colab_run.ipynb`](colab_run.ipynb) contains these steps. A sensible order is: tests on a free CPU runtime, `--estimate` on a GPU runtime, then the full run with `--out-dir` on Google Drive so that results survive a disconnection. Attention Flow runs on the CPU even when a GPU is available (the max-flow step is the expensive part), so it can be run separately on a CPU runtime:
+To use all the hardware at once, run the benchmark through the parallel launcher:
 
 ```bash
-python report.py --explainers lime shap grad_input attention_rollout lrp --out-dir /content/drive/MyDrive/xai_v2
-python report.py --explainers attention_flow --device cpu --flow-workers 2 --out-dir /content/drive/MyDrive/xai_v2
+python parallel_run.py --out-dir runs/v2            # add --dry-run to see the plan
 ```
 
-Main options: `--models`, `--explainers`, `--metrics`, `--sample` (default 400), `--max-length` (512), `--flow-max-length` (128), `--lime-samples` (500), `--shap-samples` (15), `--batch-size`, `--device`, `--no-resume`.
+It splits the texts into shards and runs several `report.py` processes together: two on the GPU (one if the machine has two CPU cores or fewer) for LIME, SHAP, Input×Gradient, Rollout and LRP, and one per free CPU core for Attention Flow, whose max-flow step runs on the CPU only (deeper models get more shards). Every text has its own seeds, so the results are the same as a single sequential run; this is checked by `tests/test_torch.py`. At the end the launcher rebuilds the tables with `report.py --summarize-only`.
 
-Outputs in `--out-dir`: `<model>/<method>/eval.jsonl` and `train.jsonl` (per-text values), `summary.json` (aggregates and counts of invalid values), `robustness_table.csv`, `consistency_table.csv`, `contrastivity_table.csv`, `run_metadata.json` (configuration, library versions, git commit).
+On Google Colab, [`colab_run.ipynb`](colab_run.ipynb) contains these steps: tests on a free CPU runtime, `--estimate` on a GPU runtime, then the parallel run with `--out-dir` on Google Drive so that results survive a disconnection. If the GPU runtime has few CPU cores, the work can be split between two runtimes on the same Drive folder: `parallel_run.py --role gpu` on the GPU runtime and `parallel_run.py --role flow` on a CPU runtime, then `report.py --summarize-only`.
+
+Main options of `report.py`: `--models`, `--explainers`, `--metrics`, `--sample` (default 400), `--max-length` (512), `--flow-max-length` (128), `--lime-samples` (500), `--shap-samples` (15), `--batch-size`, `--device`, `--shard I/N`, `--summarize-only`, `--no-resume`. Options that `parallel_run.py` does not know are passed to `report.py`.
+
+Outputs in `--out-dir`: `<model>/<method>/eval*.jsonl` and `train*.jsonl` (per-text values, one file per shard), `summary.json` (aggregates and counts of invalid values), `robustness_table.csv`, `consistency_table.csv`, `contrastivity_table.csv`, `run_metadata/` (configuration, library versions and git commit of each process), `logs/` (one log per process of the launcher).
 
 ## Choices not fixed by the thesis
 
@@ -160,9 +163,10 @@ Contrastivity (KL divergence, higher is more contrastive)
 ├── models.py           # model registry and loading
 ├── dataset.py          # 400-review sample (k-means + stratified sampling)
 ├── report.py           # benchmark runner, time estimate, tables
+├── parallel_run.py     # runs report.py in parallel on GPU and CPU cores
 ├── utils.py            # seeds, timing, result files
 ├── tests/              # test_core.py (NumPy only), test_torch.py (tiny random models)
-├── colab_run.ipynb     # tests, time estimate and full run on Colab
+├── colab_run.ipynb     # tests, time estimate and parallel run on Colab
 ├── data/imdb_clustered_400.csv
 ├── results_thesis_v1/  # tables and per-model results of the thesis run
 ├── Test.csv, Train.csv

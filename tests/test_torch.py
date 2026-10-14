@@ -383,3 +383,28 @@ def test_report_end_to_end_and_resume(tiny, tmp_path):
     p.write_text("\n".join(lines[:3]) + "\n" + lines[3][:10])  # ultima riga troncata
     assert report.main(argv) == 0
     assert len({r["i"] for r in read_jsonl(p)}) == 6
+
+
+def test_parallel_run_gives_same_tables_as_sequential(tiny, tmp_path):
+    """Il launcher parallelo (shard su più processi) deve dare gli stessi numeri del run unico."""
+    import subprocess
+    import sys
+    import pandas as pd
+    import report
+    common = ["--sample", "6", "--max-length", str(MAXLEN), "--flow-max-length", "32", "--lime-samples", "20",
+              "--batch-size", "8", "--no-amp", "--local-model", *[f"{k}={v}" for k, v in tiny.items()]]
+    seq, par = tmp_path / "seq", tmp_path / "par"
+    assert report.main(["--models", *KEYS, "--device", "cpu", "--threads", "1", "--out-dir", str(seq)] + common) == 0
+    root = Path(report.__file__).resolve().parent
+    cmd = [sys.executable, str(root / "parallel_run.py"), "--models", *KEYS, "--out-dir", str(par),
+           "--gpu-lanes", "2", "--flow-procs", "2", "--poll", "30"] + common
+    res = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
+    assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-3000:]
+    for metric in ("robustness", "contrastivity"):
+        a = pd.read_csv(seq / f"{metric}_table.csv", index_col=0).sort_index()
+        b = pd.read_csv(par / f"{metric}_table.csv", index_col=0).reindex(index=a.index, columns=a.columns)
+        assert np.allclose(a.values, b.values, rtol=1e-5, atol=1e-7), f"{metric}\n{a}\n{b}"
+    a = pd.read_csv(seq / "consistency_table.csv", index_col=0).sort_index()
+    b = pd.read_csv(par / "consistency_table.csv", index_col=0).reindex(index=a.index, columns=a.columns)
+    to_num = lambda df: df.apply(lambda col: col.map(lambda v: float(v.split("±")[0])))
+    assert np.allclose(to_num(a).values, to_num(b).values, atol=2e-4), f"{a}\n{b}"

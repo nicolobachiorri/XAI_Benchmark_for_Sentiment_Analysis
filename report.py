@@ -16,6 +16,12 @@ Esempi
 Il run si può interrompere e rilanciare con lo stesso comando: ogni testo
 completato è salvato subito (file .jsonl) e viene saltato alla ripresa.
 
+Esecuzione in parallelo: `--shard I/N` fa elaborare a questo processo solo i
+testi con indice i % N == I, in file separati (eval.s{I}of{N}.jsonl). Più
+processi possono lavorare sulla stessa cartella; i risultati non dipendono dalla
+divisione, perché ogni testo ha i propri seed. Alla fine `--summarize-only`
+ricalcola riepiloghi e tabelle da tutti i file. parallel_run.py organizza tutto.
+
 Per ogni coppia (modello, explainer):
 1. modello in eval(), seed 42: spiegazione del testo originale e delle 6
    perturbazioni (robustness); la spiegazione originale serve anche alla contrastivity;
@@ -23,14 +29,15 @@ Per ogni coppia (modello, explainer):
    (consistency).
 
 Output in --out-dir:
-    <modello>/<explainer>/eval.jsonl, train.jsonl   valori per testo
-    <modello>/<explainer>/summary.json              metriche aggregate e conteggi
+    <modello>/<explainer>/eval*.jsonl, train*.jsonl  valori per testo
+    <modello>/<explainer>/summary.json               metriche aggregate e conteggi
     robustness_table.csv, consistency_table.csv, contrastivity_table.csv
-    run_metadata.json                               configurazione, versioni, commit
+    run_metadata/*.json                              configurazione, versioni, commit (uno per processo)
 """
 
 import argparse
 import hashlib
+import os
 import platform
 import sys
 import time
@@ -49,6 +56,7 @@ EXPLAINERS = ["lime", "shap", "grad_input", "attention_rollout", "attention_flow
 METRICS = ["robustness", "consistency", "contrastivity"]
 MODEL_ORDER = ["tinybert", "distilbert", "roberta-base", "bert-large", "roberta-large"]
 FAIL_FAST_AFTER = 3  # errori consecutivi iniziali dopo cui un explainer viene fermato
+MASK_STRINGS = ("[MASK]", "<mask>")  # parole escluse dal vocabolario della contrastivity
 
 
 # =============================================================================
@@ -88,15 +96,28 @@ def _check_signature(out_dir: Path, sig: dict, resume: bool) -> None:
     save_json(path, sig)
 
 
-def _done_rows(path: Path, needed_key: Optional[str] = None, skip_errors: bool = False) -> Dict[int, dict]:
-    """Ultima riga salvata per ogni testo. Con skip_errors le righe con errori sono
-    considerate da rifare (per esempio dopo un out-of-memory)."""
+def _part_name(phase: str, shard: Optional[tuple]) -> str:
+    return f"{phase}.jsonl" if shard is None else f"{phase}.s{shard[0]}of{shard[1]}.jsonl"
+
+
+def _done_rows(out_dir: Path, phase: str, needed_key: Optional[str] = None,
+               skip_errors: bool = False) -> Dict[int, dict]:
+    """Ultima riga salvata per ogni testo, letta da tutti i file della fase (eval o
+    train), qualunque sia la divisione in shard. Con skip_errors le righe con errori
+    sono considerate da rifare (per esempio dopo un out-of-memory)."""
     rows = {}
-    for r in read_jsonl(path):
+    lines = []
+    for path in sorted(out_dir.glob(f"{phase}*.jsonl")):
+        lines.extend(read_jsonl(path))
+    for r in lines:
         if needed_key is not None and needed_key not in r:
             continue
-        if skip_errors and (r.get("error") or r.get("errors")):
+        failed = bool(r.get("error") or r.get("errors"))
+        if skip_errors and failed:
             continue
+        prev = rows.get(r["i"])
+        if prev is not None and failed and not (prev.get("error") or prev.get("errors")):
+            continue  # una riga riuscita vale più di un errore, in qualunque file sia
         rows[r["i"]] = r
     return rows
 
@@ -105,13 +126,17 @@ def _done_rows(path: Path, needed_key: Optional[str] = None, skip_errors: bool =
 # Un explainer su un modello
 # =============================================================================
 def run_explainer(model, tokenizer, explainer_name: str, texts: List[str], labels: List[int],
-                  metrics_to_compute: List[str], cfg, out_dir: Path, resume: bool = True) -> dict:
+                  metrics_to_compute: List[str], cfg, out_dir: Path, resume: bool = True,
+                  shard: Optional[tuple] = None) -> dict:
+    """Elabora i testi assegnati a questo processo (tutti, o quelli dello shard) e
+    restituisce il riepilogo calcolato su tutto ciò che c'è nella cartella."""
     import explainers
     out_dir.mkdir(parents=True, exist_ok=True)
-    eval_path, train_path = out_dir / "eval.jsonl", out_dir / "train.jsonl"
+    eval_path, train_path = out_dir / _part_name("eval", shard), out_dir / _part_name("train", shard)
     if not resume:
         for p in (eval_path, train_path):
             p.unlink(missing_ok=True)
+    mine = [i for i in range(len(texts)) if shard is None or i % shard[1] == shard[0]]
 
     _check_signature(out_dir, run_signature(explainer_name, texts, labels, cfg), resume)
     explain = explainers.get_explainer(explainer_name, model, tokenizer, cfg)
@@ -123,9 +148,9 @@ def run_explainer(model, tokenizer, explainer_name: str, texts: List[str], label
     need_rob = "robustness" in metrics_to_compute
     if need_eval:
         model.eval()
-        done = _done_rows(eval_path, "robustness" if need_rob else None, skip_errors=True)
-        todo = [i for i in range(len(texts)) if i not in done]
-        print(f"  [eval] {len(done)} testi già fatti, {len(todo)} da fare")
+        done = _done_rows(out_dir, "eval", "robustness" if need_rob else None, skip_errors=True)
+        todo = [i for i in mine if i not in done]
+        print(f"  [eval] {len(mine) - len(todo)} testi già fatti, {len(todo)} da fare")
         t0, ok, consecutive_err = time.time(), 0, 0
         for n, i in enumerate(todo, 1):
             row = {"i": i, "label": labels[i]}
@@ -153,9 +178,9 @@ def run_explainer(model, tokenizer, explainer_name: str, texts: List[str], label
 
     # ---- 2. train: consistency con dropout attivo ----
     if "consistency" in metrics_to_compute:
-        done = _done_rows(train_path, skip_errors=True)
-        todo = [i for i in range(len(texts)) if i not in done]
-        print(f"  [train] {len(done)} testi già fatti, {len(todo)} da fare")
+        done = _done_rows(out_dir, "train", skip_errors=True)
+        todo = [i for i in mine if i not in done]
+        print(f"  [train] {len(mine) - len(todo)} testi già fatti, {len(todo)} da fare")
         model.train()
         try:
             t0, ok, consecutive_err = time.time(), 0, 0
@@ -177,16 +202,17 @@ def run_explainer(model, tokenizer, explainer_name: str, texts: List[str], label
         finally:
             model.eval()
 
-    summary = summarize(eval_path, train_path, len(texts), metrics_to_compute, mask_token)
+    summary = summarize(out_dir, len(texts), metrics_to_compute)
     summary["timings"] = timings
     save_json(out_dir / "summary.json", summary)
     return summary
 
 
-def summarize(eval_path: Path, train_path: Path, n_texts: int, metrics_to_compute: List[str],
-              mask_token: str) -> dict:
+def summarize(out_dir: Path, n_texts: int, metrics_to_compute: List[str]) -> dict:
+    """Riepilogo da tutti i file della cartella (tutti gli shard)."""
     out = {"n_texts": n_texts}
-    ev = {i: r for i, r in _done_rows(eval_path).items() if i < n_texts}
+    ev = {i: r for i, r in _done_rows(out_dir, "eval").items() if i < n_texts}
+    out["n_eval_done"] = len(ev)
     out["n_eval_errors"] = sum(1 for r in ev.values() if "error" in r)
     if "robustness" in metrics_to_compute:
         per_text = [ev[i]["robustness"]["robustness"] if i in ev and "robustness" in ev[i] else None
@@ -202,9 +228,10 @@ def summarize(eval_path: Path, train_path: Path, n_texts: int, metrics_to_comput
     if "contrastivity" in metrics_to_compute:
         pos = [Attribution.from_dict(r["attr"]) for r in ev.values() if "attr" in r and r["label"] == 1]
         neg = [Attribution.from_dict(r["attr"]) for r in ev.values() if "attr" in r and r["label"] == 0]
-        out["contrastivity"] = metrics.contrastivity(pos, neg, exclude=[mask_token])
+        out["contrastivity"] = metrics.contrastivity(pos, neg, exclude=MASK_STRINGS)
     if "consistency" in metrics_to_compute:
-        tr = {i: r for i, r in _done_rows(train_path).items() if i < n_texts}
+        tr = {i: r for i, r in _done_rows(out_dir, "train").items() if i < n_texts}
+        out["n_train_done"] = len(tr)
         per_text = [tr[i]["consistency"] if i in tr else None for i in range(n_texts)]
         agg = metrics.aggregate_consistency(per_text)
         agg["n_invalid_pairs"] = sum(sum(1 for c in r["pair_correlations"] if c is None) for r in tr.values())
@@ -308,6 +335,35 @@ def library_versions() -> dict:
     return out
 
 
+def _parse_shard(spec: Optional[str]) -> Optional[tuple]:
+    if not spec:
+        return None
+    i, n = (int(x) for x in spec.split("/"))
+    if not (n >= 1 and 0 <= i < n):
+        raise ValueError(f"--shard deve essere I/N con 0 <= I < N (ricevuto {spec})")
+    return (i, n) if n > 1 else None
+
+
+def summarize_folder(out_root: Path, n_texts: int, metrics_to_compute: List[str]) -> Dict[str, pd.DataFrame]:
+    """Ricalcola tutti i summary.json e le tabelle dai file per testo, senza caricare
+    modelli (serve dopo un run diviso in più processi o in più runtime)."""
+    models_ = [m for m in MODEL_ORDER if (out_root / m).is_dir()]
+    models_ += sorted(p.name for p in out_root.iterdir()
+                      if p.is_dir() and p.name not in MODEL_ORDER and p.name != "run_metadata")
+    explainers_ = [e for e in EXPLAINERS if any((out_root / m / e).is_dir() for m in models_)]
+    for mk in models_:
+        for ex in explainers_:
+            d = out_root / mk / ex
+            if not d.is_dir():
+                continue
+            prev = _load_summary(d / "summary.json") or {}
+            s = summarize(d, n_texts, metrics_to_compute)
+            s["timings"] = prev.get("timings", {})
+            save_json(d / "summary.json", s)
+            print(f"  {mk}/{ex}: eval {s['n_eval_done']}/{n_texts}, train {s.get('n_train_done', '-')}/{n_texts}  {_short(s)}")
+    return build_tables(out_root, models_, explainers_)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="XAI benchmark (versione allineata alla tesi)")
     p.add_argument("--models", nargs="+", default=None, help=f"default: {MODEL_ORDER}")
@@ -322,13 +378,32 @@ def main(argv=None):
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--no-amp", action="store_true", help="niente float16 nei forward di LIME/SHAP")
     p.add_argument("--device", default=None, help="cuda o cpu (default: cuda se disponibile)")
+    p.add_argument("--threads", type=int, default=None, help="thread di PyTorch per questo processo")
+    p.add_argument("--shard", default=None, metavar="I/N", help="elabora solo i testi con indice %% N == I")
     p.add_argument("--out-dir", default="runs/v2")
-    p.add_argument("--no-resume", action="store_true", help="ricomincia da zero (cancella i .jsonl)")
+    p.add_argument("--no-resume", action="store_true",
+                   help="ricomincia da zero (cancella i .jsonl di questo processo/shard)")
     p.add_argument("--local-model", nargs="*", default=[], metavar="KEY=PATH",
                    help="modelli locali aggiuntivi (usati dai test)")
     p.add_argument("--estimate", action="store_true", help="stima i tempi e termina")
+    p.add_argument("--summarize-only", action="store_true",
+                   help="ricalcola riepiloghi e tabelle dai file esistenti, senza caricare modelli")
     args = p.parse_args(argv)
+    shard = _parse_shard(args.shard)
+    out_root = Path(args.out_dir)
 
+    if args.summarize_only:
+        n_texts = len(dataset.get_clustered_sample(args.sample)[0])
+        tables = summarize_folder(out_root, n_texts, args.metrics)
+        _print_tables(tables)
+        return 0
+
+    if args.threads:
+        try:
+            import torch
+            torch.set_num_threads(args.threads)
+        except ImportError:
+            pass
     import explainers
     import models
     if args.device:
@@ -346,25 +421,29 @@ def main(argv=None):
                                      shap_samples=args.shap_samples, batch_size=args.batch_size,
                                      amp=not args.no_amp)
     raw_texts, labels = dataset.get_clustered_sample(args.sample)
-    print(f"[DATA] {len(raw_texts)} testi ({sum(labels)} positivi), device {models.DEVICE}")
+    tag = "" if shard is None else f" shard {shard[0]}/{shard[1]}"
+    print(f"[DATA] {len(raw_texts)} testi ({sum(labels)} positivi), device {models.DEVICE}{tag}")
 
     if args.estimate:
         estimate(models_, args.explainers, args.metrics, cfg, n_texts=len(raw_texts))
         return 0
 
-    out_root = Path(args.out_dir)
     out_root.mkdir(parents=True, exist_ok=True)
-    meta = {"git_commit": git_commit(), "argv": sys.argv, "config": vars(cfg),
-            "metrics": args.metrics, "explainers": args.explainers, "models": {m: models.MODELS[m] for m in models_},
+    run_id = time.strftime("%Y%m%d-%H%M%S") + f"-pid{os.getpid()}"
+    meta = {"run_id": run_id, "git_commit": git_commit(), "argv": sys.argv, "config": vars(cfg),
+            "shard": shard, "metrics": args.metrics, "explainers": args.explainers,
+            "models": {m: models.MODELS[m] for m in models_},
             "n_texts": len(raw_texts), "n_positive": int(sum(labels)),
             "dataset_sha256": hashlib.sha256("\n".join(raw_texts).encode()).hexdigest(),
             "consistency_seeds": metrics.CONSISTENCY_SEEDS, "perturbation_ratio": metrics.PERTURBATION_RATIO,
             "perturbations_per_type": metrics.N_PERTURBATIONS_PER_TYPE,
             "contrastivity_vocab_size": metrics.CONTRASTIVITY_VOCAB_SIZE,
             "device": str(models.DEVICE), "versions": library_versions(), "truncation": {}}
+    meta_path = out_root / "run_metadata" / f"{run_id}.json"
+    shard_tag = "" if shard is None else f".s{shard[0]}of{shard[1]}"
 
     for mk in models_:
-        print(f"\n{'=' * 70}\n MODELLO {mk}\n{'=' * 70}")
+        print(f"\n{'=' * 70}\n MODELLO {mk}{tag}\n{'=' * 70}")
         with Timer(f"caricamento {mk}"):
             model, tok = models.load_model(mk), models.load_tokenizer(mk)
         texts = prepare_texts(tok, raw_texts, cfg.max_length)
@@ -372,25 +451,33 @@ def main(argv=None):
         meta["truncation"][mk] = {"texts_truncated_at_max_length": int(n_cut)}
         print(f"[DATA] {n_cut}/{len(texts)} testi troncati a {cfg.max_length} token")
         for ex in args.explainers:
-            print(f"\n[{mk}] {ex}")
+            print(f"\n[{mk}] {ex}{tag}")
             try:
                 with Timer(f"{mk}/{ex}"):
                     s = run_explainer(model, tok, ex, texts, labels, args.metrics, cfg,
-                                      out_root / mk / ex, resume=not args.no_resume)
+                                      out_root / mk / ex, resume=not args.no_resume, shard=shard)
                 print(f"  -> {_short(s)}")
+                (out_root / mk / ex / f"failed{shard_tag}.json").unlink(missing_ok=True)
             except Exception as e:
                 print(f"  [ERRORE] {mk}/{ex}: {type(e).__name__}: {e}")
-                save_json(out_root / mk / ex / "failed.json", {"error": f"{type(e).__name__}: {e}"})
+                save_json(out_root / mk / ex / f"failed{shard_tag}.json", {"error": f"{type(e).__name__}: {e}"})
         del model
         models.clear_gpu_memory()
-        save_json(out_root / "run_metadata.json", meta)
+        save_json(meta_path, meta)
 
-    tables = build_tables(out_root, models_, args.explainers)
+    save_json(meta_path, meta)
+    if shard is None:
+        _print_tables(build_tables(out_root, models_, args.explainers))
+    else:
+        print("\n[SHARD] fatto. Quando tutti i processi hanno finito: python report.py --summarize-only "
+              f"--out-dir {out_root}")
+    return 0
+
+
+def _print_tables(tables: Dict[str, pd.DataFrame]) -> None:
     for m, df in tables.items():
         if not df.empty:
             print(f"\n{m.upper()}\n{df.to_string(float_format=lambda x: f'{x:.4f}')}")
-    save_json(out_root / "run_metadata.json", meta)
-    return 0
 
 
 def _short(s: dict) -> str:

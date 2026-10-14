@@ -80,7 +80,7 @@ On Google Colab, [`colab_run.ipynb`](colab_run.ipynb) contains these steps: test
 
 Main options of `report.py`: `--models`, `--explainers`, `--metrics`, `--sample` (default 400), `--max-length` (512), `--flow-max-length` (128), `--lime-samples` (500), `--shap-samples` (15), `--batch-size`, `--device`, `--shard I/N`, `--summarize-only`, `--no-resume`. Options that `parallel_run.py` does not know are passed to `report.py`.
 
-Outputs in `--out-dir`: `<model>/<method>/eval*.jsonl` and `train*.jsonl` (per-text values, one file per shard), `summary.json` (aggregates and counts of invalid values), `robustness_table.csv`, `consistency_table.csv`, `contrastivity_table.csv`, `run_metadata/` (configuration, library versions and git commit of each process), `logs/` (one log per process of the launcher).
+Outputs in `--out-dir`: `<model>/<method>/eval*.jsonl` and `train*.jsonl` (per-text values, one file per shard), `summary.json` (aggregates and counts of invalid values), `robustness_table.csv`, `consistency_table.csv`, `contrastivity_table.csv`, `contrastivity_js_table.csv`, `run_metadata/` (configuration, library versions and git commit of each process), `logs/` (one log per process of the launcher).
 
 ## Choices not fixed by the thesis
 
@@ -89,7 +89,7 @@ Outputs in `--out-dir`: `<model>/<method>/eval*.jsonl` and `train*.jsonl` (per-t
 - **Truncation**: 512 tokens for all methods except Attention Flow, which uses the first 128 tokens. Exact max-flow costs roughly L·n³: on one CPU core it takes about 3 s per explanation for a 24-layer model at 128 tokens and an estimated 4 minutes at 512, which would make the full run impractical. 46 of the 400 reviews have more than 380 words, about the 512-token limit, so for those the other methods also see only the beginning.
 - **LIME samples**: 500 (the thesis does not state a number; the library default is 5,000).
 - **Robustness**: two perturbations per strategy; a perturbation that cannot be applied (for example no word in the synonym dictionary) is recorded and excluded, not scored. The synonym dictionary has 130 entries.
-- **Contrastivity**: scores are divided by the maximum absolute score of each explanation before summing. This keeps the sign, which the "S − min S" step needs, and gives each text the same weight. With [0, 1] scores, every word absent from one class would get probability zero and the divergence would be dominated by ε. The comparison uses the true labels of the texts.
+- **Contrastivity**: scores are divided by the maximum absolute score of each explanation before summing. This keeps the sign, which the "S − min S" step needs, and gives each text the same weight. With [0, 1] scores, every word absent from one class would get probability zero and the divergence would be dominated by ε. The comparison uses the true labels of the texts. By construction of the formula, words with the minimum score in the negative class get probability zero, so part of the KL value comes from ε alone (reported as `kl_from_zero_neg` in `summary.json`). This is strongest for Rollout and Flow, whose scores are never negative. For this reason the Jensen-Shannon divergence, which the thesis mentions as the symmetric alternative (p. 50), is also reported (`contrastivity_js_table.csv`): it is bounded in [0, 1] and needs no ε.
 - **Invalid values** (for example Spearman on a constant explanation): `NaN`, excluded from the means and counted in `summary.json`.
 - **Precision**: weights in float32; float16 autocast only for the gradient-free forward passes of LIME and SHAP on GPU.
 

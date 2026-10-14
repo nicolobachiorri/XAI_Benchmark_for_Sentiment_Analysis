@@ -244,7 +244,7 @@ def summarize(out_dir: Path, n_texts: int, metrics_to_compute: List[str]) -> dic
 # Tabelle
 # =============================================================================
 def build_tables(out_root: Path, models_: List[str], explainers_: List[str]) -> Dict[str, pd.DataFrame]:
-    rows = {m: {} for m in METRICS}
+    rows = {m: {} for m in METRICS + ["contrastivity_js"]}
     for mk in models_:
         for ex in explainers_:
             s = _load_summary(out_root / mk / ex / "summary.json")
@@ -254,6 +254,8 @@ def build_tables(out_root: Path, models_: List[str], explainers_: List[str]) -> 
                 rows["robustness"].setdefault(ex, {})[mk] = s["robustness"]["mean"]
             if s.get("contrastivity"):
                 rows["contrastivity"].setdefault(ex, {})[mk] = s["contrastivity"]["contrastivity"]
+                if s["contrastivity"].get("js_divergence") is not None:
+                    rows["contrastivity_js"].setdefault(ex, {})[mk] = s["contrastivity"]["js_divergence"]
             if s.get("consistency") and s["consistency"]["mean"] is not None:
                 c = s["consistency"]
                 rows["consistency"].setdefault(ex, {})[mk] = f"{c['mean']:.4f}±{(c['std'] or 0):.4f}"

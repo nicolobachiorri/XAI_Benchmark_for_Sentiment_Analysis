@@ -270,3 +270,13 @@ def test_contrastivity_signed_scale_limits_zero_probabilities():
 def test_signed_scores_keep_sign_and_scale():
     a = Attribution(["a", "b", "c"], [-2.0, 1.0, 0.0])
     assert np.allclose(a.signed_scores, [-1.0, 0.5, 0.0])
+
+
+def test_contrastivity_js_bounded_and_zero_for_identical():
+    a = Attribution(["good", "bad", "film"], [1, -1, 0.5])
+    assert M.contrastivity([a], [a])["js_divergence"] == pytest.approx(0.0, abs=1e-12)
+    pos = [Attribution(["great", "film"], [1.0, 0.0])]
+    neg = [Attribution(["awful", "plot"], [1.0, 0.0])]
+    r = M.contrastivity(pos, neg)
+    assert 0 < r["js_divergence"] <= 1
+    assert r["kl_from_zero_neg"] <= r["contrastivity"] + 1e-12

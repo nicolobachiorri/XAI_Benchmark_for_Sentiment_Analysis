@@ -75,8 +75,9 @@ def _roberta_tokenizer(texts):
     trainer = trainers.BpeTrainer(vocab_size=800, special_tokens=["<s>", "<pad>", "</s>", "<unk>", "<mask>"],
                                   initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
     tk.train_from_iterator(texts, trainer)
-    tk.post_processor = processors.RobertaProcessing(sep=("</s>", tk.token_to_id("</s>")),
-                                                     cls=("<s>", tk.token_to_id("<s>")),
+    # argomenti posizionali: i nomi dei parametri cambiano tra versioni di `tokenizers`
+    tk.post_processor = processors.RobertaProcessing(("</s>", tk.token_to_id("</s>")),
+                                                     ("<s>", tk.token_to_id("<s>")),
                                                      trim_offsets=True, add_prefix_space=False)
     return PreTrainedTokenizerFast(tokenizer_object=tk, bos_token="<s>", eos_token="</s>", unk_token="<unk>",
                                   pad_token="<pad>", cls_token="<s>", sep_token="</s>", mask_token="<mask>",

@@ -9,10 +9,10 @@ The benchmark compares six post-hoc explanation methods on five fine-tuned encod
 | | `thesis-v1` (tag) | `v2` (this branch) |
 |---|---|---|
 | Commit | `fc73a9e`, 22 Aug 2025 | current |
-| Produced the thesis tables | yes (run of 22 Aug 2025, saved in [`results_thesis_v1/`](results_thesis_v1)) | no, results pending |
+| Produced the thesis tables | yes (run of 22 Aug 2025, saved in [`results_thesis_v1/`](results_thesis_v1)) | no: own run of 15 Oct 2026, saved in [`results_v2/`](results_v2) |
 | Matches the methods described in the thesis | partly, see [Known issues in v1](#known-issues-in-v1) | yes, with the choices listed in [Choices not fixed by the thesis](#choices-not-fixed-by-the-thesis) |
 
-The numbers in the thesis come from `thesis-v1`. A later clean-up (September 2025) removed unused code and broke `report.py`, but did not change the explainers or the logic of the metrics. `v2` rewrites them to follow the definitions in chapters 2 and 3 of the thesis. Because the implementations change, the `v2` numbers are expected to differ from the thesis tables.
+The numbers in the thesis come from `thesis-v1`. A later clean-up (September 2025) removed unused code and broke `report.py`, but did not change the explainers or the logic of the metrics. `v2` rewrites them to follow the definitions in chapters 2 and 3 of the thesis. Because the implementations change, the `v2` numbers differ from the thesis tables; see [Results (v2)](#results-v2).
 
 ## Methods
 
@@ -80,7 +80,7 @@ On Google Colab, [`colab_run.ipynb`](colab_run.ipynb) contains these steps: test
 
 Main options of `report.py`: `--models`, `--explainers`, `--metrics`, `--sample` (default 400), `--max-length` (512), `--flow-max-length` (128), `--lime-samples` (500), `--shap-samples` (15), `--batch-size`, `--device`, `--shard I/N`, `--summarize-only`, `--no-resume`. Options that `parallel_run.py` does not know are passed to `report.py`.
 
-Outputs in `--out-dir`: `<model>/<method>/eval*.jsonl` and `train*.jsonl` (per-text values, one file per shard), `summary.json` (aggregates and counts of invalid values), `robustness_table.csv`, `consistency_table.csv`, `contrastivity_table.csv`, `run_metadata/` (configuration, library versions and git commit of each process), `logs/` (one log per process of the launcher).
+Outputs in `--out-dir`: `<model>/<method>/eval*.jsonl` and `train*.jsonl` (per-text values, one file per shard), `summary.json` (aggregates and counts of invalid values), `robustness_table.csv`, `consistency_table.csv`, `contrastivity_table.csv`, `contrastivity_js_table.csv`, `run_metadata/` (configuration, library versions and git commit of each process), `logs/` (one log per process of the launcher).
 
 ## Choices not fixed by the thesis
 
@@ -89,7 +89,7 @@ Outputs in `--out-dir`: `<model>/<method>/eval*.jsonl` and `train*.jsonl` (per-t
 - **Truncation**: 512 tokens for all methods except Attention Flow, which uses the first 128 tokens. Exact max-flow costs roughly L·n³: on one CPU core it takes about 3 s per explanation for a 24-layer model at 128 tokens and an estimated 4 minutes at 512, which would make the full run impractical. 46 of the 400 reviews have more than 380 words, about the 512-token limit, so for those the other methods also see only the beginning.
 - **LIME samples**: 500 (the thesis does not state a number; the library default is 5,000).
 - **Robustness**: two perturbations per strategy; a perturbation that cannot be applied (for example no word in the synonym dictionary) is recorded and excluded, not scored. The synonym dictionary has 130 entries.
-- **Contrastivity**: scores are divided by the maximum absolute score of each explanation before summing. This keeps the sign, which the "S − min S" step needs, and gives each text the same weight. With [0, 1] scores, every word absent from one class would get probability zero and the divergence would be dominated by ε. The comparison uses the true labels of the texts.
+- **Contrastivity**: scores are divided by the maximum absolute score of each explanation before summing. This keeps the sign, which the "S − min S" step needs, and gives each text the same weight. With [0, 1] scores, every word absent from one class would get probability zero and the divergence would be dominated by ε. The comparison uses the true labels of the texts. By construction of the formula, words with the minimum score in the negative class get probability zero, so part of the KL value comes from ε alone (reported as `kl_from_zero_neg` in `summary.json`). This is strongest for Rollout and Flow, whose scores are never negative. For this reason the Jensen-Shannon divergence, which the thesis mentions as the symmetric alternative (p. 50), is also reported (`contrastivity_js_table.csv`): it is bounded in [0, 1] and needs no ε.
 - **Invalid values** (for example Spearman on a constant explanation): `NaN`, excluded from the means and counted in `summary.json`.
 - **Precision**: weights in float32; float16 autocast only for the gradient-free forward passes of LIME and SHAP on GPU.
 
@@ -109,6 +109,65 @@ Found when comparing `thesis-v1` with the thesis text. They affect the tables in
 - Robustness: the synonym dictionary had 12 entries and in most texts the substitution changed nothing; any error returned 0.0, the best possible score. Several fallbacks returned fixed values (0.05, 0.1) instead of missing values.
 - Scores were normalised to [−1, 1] for four methods and left raw for LIME and SHAP, so the metrics compared different scales.
 - Text, p. 52: SHAP on RoBERTa-large is reported as 0.0012, the table says 0.0117.
+
+## Results (v2)
+
+One run of `parallel_run.py` on a Colab A100 (12 CPU cores), 15 October 2026, 6.8 hours: 400 texts, 5 models, 6 methods, 3 metrics, no failed text. Per-text values are not in the repository (several hundred MB); the tables are in [`results_v2/`](results_v2).
+
+Robustness (lower is more stable)
+
+| Method | tinybert | distilbert | roberta-base | bert-large | roberta-large |
+|---|---|---|---|---|---|
+| LIME | 0.0951 | 0.1268 | 0.1404 | 0.1176 | 0.1537 |
+| SHAP | 0.1663 | 0.1415 | 0.1500 | 0.1703 | 0.1044 |
+| Input×Gradient | 0.1448 | 0.1326 | 0.1443 | 0.1609 | 0.2186 |
+| Attention Rollout | 0.0365 | 0.0237 | 0.0263 | 0.0416 | 0.0185 |
+| Attention Flow | 0.0202 | 0.0094 | 0.0104 | 0.0094 | 0.0120 |
+| LRP | 0.0831 | 0.0948 | 0.0799 | 0.1643 | 0.0790 |
+
+Consistency (mean ± sd over 400 texts)
+
+| Method | tinybert | distilbert | roberta-base | bert-large | roberta-large |
+|---|---|---|---|---|---|
+| LIME | 0.2548 ± 0.1453 | 0.1824 ± 0.1296 | 0.1419 ± 0.1130 | 0.2045 ± 0.1359 | 0.1115 ± 0.1018 |
+| SHAP | 0.0095 ± 0.0358 | 0.0093 ± 0.0356 | 0.0092 ± 0.0358 | 0.0055 ± 0.0378 | 0.0066 ± 0.0357 |
+| Input×Gradient | 0.3642 ± 0.0988 | 0.4024 ± 0.0597 | 0.1893 ± 0.0679 | 0.2261 ± 0.0911 | 0.0999 ± 0.0766 |
+| Attention Rollout | 0.8613 ± 0.0509 | 0.9133 ± 0.0256 | 0.9291 ± 0.0196 | 0.9362 ± 0.0152 | 0.8184 ± 0.0454 |
+| Attention Flow | 0.9397 ± 0.0184 | 0.9201 ± 0.0224 | 0.9477 ± 0.0132 | 0.9464 ± 0.0114 | 0.9554 ± 0.0128 |
+| LRP | 0.7884 ± 0.0475 | 0.8618 ± 0.0384 | 0.8135 ± 0.1225 | 0.3328 ± 0.1456 | 0.8497 ± 0.0747 |
+
+Contrastivity, KL divergence as defined in the thesis (higher is more contrastive; affected by ε, see [Choices](#choices-not-fixed-by-the-thesis))
+
+| Method | tinybert | distilbert | roberta-base | bert-large | roberta-large |
+|---|---|---|---|---|---|
+| LIME | 0.0350 | 0.0340 | 0.0351 | 0.0385 | 0.0283 |
+| SHAP | 2.3351 | 1.2276 | 0.4125 | 1.5574 | 0.0581 |
+| Input×Gradient | 0.0155 | 0.0220 | 0.0735 | 0.0254 | 0.0559 |
+| Attention Rollout | 0.3346 | 0.3603 | 0.3201 | 0.2792 | 0.2811 |
+| Attention Flow | 0.6469 | 0.6267 | 0.6605 | 0.6295 | 0.6253 |
+| LRP | 0.0753 | 0.1446 | 1.2319 | 0.0003 | 1.7753 |
+
+Contrastivity, Jensen-Shannon divergence (bounded in [0, 1], no ε)
+
+| Method | tinybert | distilbert | roberta-base | bert-large | roberta-large |
+|---|---|---|---|---|---|
+| LIME | 0.0054 | 0.0043 | 0.0057 | 0.0059 | 0.0037 |
+| SHAP | 0.1888 | 0.0876 | 0.0286 | 0.1906 | 0.0049 |
+| Input×Gradient | 0.0023 | 0.0033 | 0.0054 | 0.0018 | 0.0097 |
+| Attention Rollout | 0.0662 | 0.0539 | 0.0493 | 0.0450 | 0.0467 |
+| Attention Flow | 0.0703 | 0.0654 | 0.0674 | 0.0655 | 0.0652 |
+| LRP | 0.0154 | 0.0274 | 0.1523 | 0.0001 | 0.1926 |
+
+### Reading the results
+
+- **Attention Flow and Attention Rollout** are the most stable methods. Flow is first on robustness and consistency for every model; Rollout is second, except for consistency on roberta-large, where LRP is slightly higher (0.850 against 0.818). This agrees with the thesis.
+- **LRP and Input×Gradient now differ.** With the AH and LN rules, LRP is more robust and much more consistent than Input×Gradient on four models out of five. In v1 the two methods were almost identical because LRP was in practice Input×Gradient.
+- **SHAP with 15 coalitions is close to noise.** Its consistency is about 0.01 on every model: with 15 samples for a few hundred words, two runs with different seeds give unrelated explanations. The thesis setting (15 samples) is kept; a reliable SHAP estimate would need far more samples.
+- **LIME (500 samples)** has low consistency (0.11 to 0.25), for the same reason on a smaller scale.
+- **Contrastivity mostly reflects vocabulary.** If every word gets the same score, the metric only sees how often words occur in positive and negative reviews. This baseline gives a Jensen-Shannon divergence of 0.036 on the first 380 words and 0.053 on the first 100 (about the 128 tokens seen by Flow). Rollout (0.045 to 0.066) and Flow (0.065 to 0.070) are only slightly above it, because their scores are never negative and change little from word to word. Signed methods (Input×Gradient, LIME) fall below the baseline because positive and negative contributions cancel in the sums. The metric, as defined, does not separate the explanation from word frequency.
+- **LRP on bert-large is an open anomaly.** Robustness 0.164, consistency 0.33 and contrastivity close to zero, while LRP works well on the other four models, including tinybert and distilbert from the same BERT family. Comparing the per-text explanations with roberta-large (also 24 layers): relevance is equally spread over the words in both models, but on bert-large its sum has a median of −2.5 on negative reviews and −0.35 on positive ones (roberta-large: −192 and +57), and the most relevant word is most often a contraction split into several tokens (`it's`, `don't`), not a sentiment word. One hypothesis, a saturated tanh in the BERT pooler blocking the gradient, was tested and rejected: on 15 reviews only 5% of the pooler units are saturated and the summed relevance is 0.42 times the logit. The cause is not known yet.
+
+Compared with the thesis, the ranking on stability holds (attention methods first), while the conclusions on contrastivity do not: in v1 Input×Gradient and LRP looked the most contrastive and the attention methods the least, partly because of the alphabetical vocabulary and the 40-text cap.
 
 ## Results reported in the thesis (v1)
 
@@ -169,6 +228,7 @@ Contrastivity (KL divergence, higher is more contrastive)
 ├── colab_run.ipynb     # tests, time estimate and parallel run on Colab
 ├── data/imdb_clustered_400.csv
 ├── results_thesis_v1/  # tables and per-model results of the thesis run
+├── results_v2/         # tables of the v2 run
 ├── Test.csv, Train.csv
 └── triennale_895103.pdf
 ```

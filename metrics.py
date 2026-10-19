@@ -315,7 +315,7 @@ def contrastivity(pos_attrs: Sequence[Attribution], neg_attrs: Sequence[Attribut
                 S[cls][t] += float(s)
                 freq[t] += 1
     if len(freq) < 2 or not pos_attrs or not neg_attrs:
-        return {"contrastivity": None, "vocab_size": len(freq)}
+        return {"contrastivity": None, "js_divergence": None, "vocab_size": len(freq)}
     vocab = [t for t, _ in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:vocab_size]]
 
     def dist(counter):
@@ -326,6 +326,15 @@ def contrastivity(pos_attrs: Sequence[Attribution], neg_attrs: Sequence[Attribut
 
     p, q = dist(S["pos"]), dist(S["neg"])
     mask = p > 0
-    kl = float(np.sum(p[mask] * np.log2(p[mask] / (q[mask] + eps))))
-    return {"contrastivity": kl, "vocab_size": len(vocab), "n_pos": len(pos_attrs), "n_neg": len(neg_attrs),
-            "scale": scale, "n_vocab_zero_in_neg": int(np.sum(mask & (q == 0)))}
+    terms = p[mask] * np.log2(p[mask] / (q[mask] + eps))
+    kl = float(np.sum(terms))
+    zero_q = q[mask] == 0
+    # Jensen-Shannon in base 2 (tesi, p. 50: alternativa simmetrica), in [0, 1] e senza eps
+    m = 0.5 * (p + q)
+    js = 0.5 * float(np.sum(p[p > 0] * np.log2(p[p > 0] / m[p > 0]))) + \
+        0.5 * float(np.sum(q[q > 0] * np.log2(q[q > 0] / m[q > 0])))
+    return {"contrastivity": kl, "js_divergence": js, "vocab_size": len(vocab),
+            "n_pos": len(pos_attrs), "n_neg": len(neg_attrs), "scale": scale,
+            "n_vocab_zero_in_neg": int(np.sum(zero_q)),
+            # quota della KL dovuta a parole con P- = 0, cioè al solo eps
+            "kl_from_zero_neg": float(np.sum(terms[zero_q]))}

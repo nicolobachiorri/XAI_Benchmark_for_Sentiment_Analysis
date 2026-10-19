@@ -75,8 +75,9 @@ def _roberta_tokenizer(texts):
     trainer = trainers.BpeTrainer(vocab_size=800, special_tokens=["<s>", "<pad>", "</s>", "<unk>", "<mask>"],
                                   initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
     tk.train_from_iterator(texts, trainer)
-    tk.post_processor = processors.RobertaProcessing(sep=("</s>", tk.token_to_id("</s>")),
-                                                     cls=("<s>", tk.token_to_id("<s>")),
+    # argomenti posizionali: i nomi dei parametri cambiano tra versioni di `tokenizers`
+    tk.post_processor = processors.RobertaProcessing(("</s>", tk.token_to_id("</s>")),
+                                                     ("<s>", tk.token_to_id("<s>")),
                                                      trim_offsets=True, add_prefix_space=False)
     return PreTrainedTokenizerFast(tokenizer_object=tk, bos_token="<s>", eos_token="</s>", unk_token="<unk>",
                                   pad_token="<pad>", cls_token="<s>", sep_token="</s>", mask_token="<mask>",
@@ -198,7 +199,7 @@ def test_grad_input_matches_manual_computation(tiny):
     a = explainers.get_explainer("grad_input", model, tok, CFG)(text)
     enc = tok(text, return_tensors="pt", truncation=True, max_length=MAXLEN)
     emb = model.get_input_embeddings()(enc["input_ids"]).detach().requires_grad_(True)
-    out = model(inputs_embeds=emb, attention_mask=enc["attention_mask"], token_type_ids=enc["token_type_ids"])
+    out = model(inputs_embeds=emb, **{k: enc[k] for k in ("attention_mask", "token_type_ids") if k in enc})
     out.logits[0, 1].backward()
     per_token = (emb * emb.grad).sum(-1)[0]
     assert np.isclose(sum(a.raw_scores), float(per_token[1:-1].sum()), rtol=1e-4, atol=1e-6)
@@ -282,11 +283,11 @@ def _relevance_at_embedding_sum(model, enc, use_rules):
     try:
         if use_rules:
             with explainers.lrp_rules():
-                out = model(inputs_embeds=emb, attention_mask=enc["attention_mask"], token_type_ids=enc["token_type_ids"])
+                out = model(inputs_embeds=emb, **{k: enc[k] for k in ("attention_mask", "token_type_ids") if k in enc})
                 logit = out.logits[0, 1]
                 (g,) = torch.autograd.grad(logit, emb)
         else:
-            out = model(inputs_embeds=emb, attention_mask=enc["attention_mask"], token_type_ids=enc["token_type_ids"])
+            out = model(inputs_embeds=emb, **{k: enc[k] for k in ("attention_mask", "token_type_ids") if k in enc})
             logit = out.logits[0, 1]
             (g,) = torch.autograd.grad(logit, emb)
     finally:
@@ -369,7 +370,10 @@ def test_report_end_to_end_and_resume(tiny, tmp_path):
             assert s["robustness"]["n_valid"] == 6, (key, ex, s["robustness"])
             assert s["consistency"]["n_total"] == 6 and s["consistency"]["n_errors"] == 0, (key, ex)
             assert s["contrastivity"]["n_pos"] == 3 and s["contrastivity"]["n_neg"] == 3
-    meta = json.loads((out / "run_metadata.json").read_text())
+            assert 0 <= s["contrastivity"]["js_divergence"] <= 1
+    metas = sorted((out / "run_metadata").glob("*.json"))
+    assert metas, "manca run_metadata/*.json"
+    meta = json.loads(metas[-1].read_text())
     assert meta["n_texts"] == 6 and meta["config"]["max_length"] == MAXLEN
 
     # ripresa: un secondo lancio non ricalcola nulla
